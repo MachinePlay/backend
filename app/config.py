@@ -9,13 +9,26 @@ class Settings(BaseSettings):
 
     tc: str = Field(default="30+0.3", validation_alias="MACHINEPLAY_TC")
 
-    # Where uploaded engine image tarballs are stored (relative to the backend
-    # working dir unless absolute). Add `storage/` to .gitignore.
-    storage_dir: Path = Field(default=Path("storage"), validation_alias="STORAGE_DIR")
-    # Reject engine tarballs larger than this (bytes). Default 200 MB.
-    max_upload_bytes: int = Field(
-        default=200 * 1024 * 1024, validation_alias="MAX_UPLOAD_BYTES"
+    # Docker registry that engines are pushed to. `registry_host` is the public
+    # hostname the CLI tags/pushes to and that the runner pulls from; it doubles
+    # as the JWT `aud`/`service` the registry validates against. `registry_issuer`
+    # must match the registry's `auth.token.issuer`. `registry_auth_key` is the
+    # RSA private key (PEM) used to sign registry tokens; its self-signed cert is
+    # the registry's `auth.token.rootcertbundle`. Provide the key inline
+    # (REGISTRY_AUTH_KEY) or by path (REGISTRY_AUTH_KEY_FILE); the file wins.
+    registry_host: str = Field(
+        default="registry.machineplay.org", validation_alias="REGISTRY_HOST"
     )
+    registry_issuer: str = Field(
+        default="machineplay-auth", validation_alias="REGISTRY_ISSUER"
+    )
+    registry_auth_key: str = Field(default="", validation_alias="REGISTRY_AUTH_KEY")
+    registry_auth_key_file: Path | None = Field(
+        default=None, validation_alias="REGISTRY_AUTH_KEY_FILE"
+    )
+    # How long an issued registry token is valid (seconds).
+    registry_token_ttl: int = Field(default=300, validation_alias="REGISTRY_TOKEN_TTL")
+
     mongo_url: str = Field(
         default="mongodb://localhost:27017", validation_alias="MONGO_URL"
     )

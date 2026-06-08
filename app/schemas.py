@@ -55,6 +55,8 @@ class EngineVersionOut(BaseModel):
     id: UUID
     version: str
     size_bytes: int
+    image_repository: str | None = None
+    image_digest: str | None = None
     created_at: datetime
 
 
@@ -67,6 +69,18 @@ class EngineDetailOut(BaseModel):
     versions: list[EngineVersionOut]
 
 
+class EngineRegisterRequest(BaseModel):
+    # Display name read from the engine's UCI `id name` reply.
+    name: str
+    version: str
+    # Docker repository the CLI pushed to, e.g. "alice/myengine" (no host/tag).
+    repository: str
+    # Image digest from `docker push`, e.g. "sha256:…".
+    digest: str
+    # Image size in bytes (from `docker inspect`), for display.
+    size_bytes: int = 0
+
+
 class EngineUploadResponse(BaseModel):
     engine_id: UUID
     name: str
@@ -77,6 +91,15 @@ class EngineUploadResponse(BaseModel):
 
 class TokenOut(BaseModel):
     token: str
+
+
+class RegistryTokenOut(BaseModel):
+    """Docker Registry v2 token response (`GET /registry/token`)."""
+
+    token: str
+    access_token: str
+    expires_in: int
+    issued_at: str
 
 
 class LiveStreamEvent(BaseModel):

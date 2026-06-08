@@ -1,14 +1,11 @@
 import asyncio
 import logging
 from collections.abc import AsyncIterable
-from uuid import UUID, uuid4
+from uuid import UUID
 
 from fastapi import (
     APIRouter,
     Depends,
-    File,
-    Form,
-    UploadFile,
     WebSocket,
     WebSocketDisconnect,
 )
@@ -22,13 +19,13 @@ from app.config import settings
 from app.exceptions import (
     ConflictError,
     NotFoundError,
-    PayloadTooLargeError,
     RunnerBusyError,
 )
 from app.models import Engine, EngineVersion, Game, User
 from app.schemas import (
     EngineDetailOut,
     EngineOut,
+    EngineRegisterRequest,
     EngineUploadResponse,
     EngineVersionOut,
     GameOut,
@@ -40,9 +37,6 @@ from app.schemas import (
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
-
-# Read uploaded tarballs in 1 MiB chunks so we never hold the whole image in RAM.
-_UPLOAD_CHUNK = 1024 * 1024
 
 
 async def _engine_to_out(engine: Engine) -> EngineOut:
@@ -83,22 +77,31 @@ async def get_engine(engine_id: UUID) -> EngineDetailOut:
     )
 
 
-@router.post("/engine/upload", response_model=EngineUploadResponse)
-async def upload_engine(
-    name: str = Form(...),
-    version: str = Form(...),
-    image: UploadFile = File(...),
+@router.post("/engine/register", response_model=EngineUploadResponse)
+async def register_engine(
+    payload: EngineRegisterRequest,
     user: User = Depends(require_token_user),
 ) -> EngineUploadResponse:
-    """Accept a `docker save` tarball for engine `<user>/<name>` version `version`.
+    """Record an engine version after the CLI pushed its image to the registry.
 
-    Find-or-create the engine, then store the tarball and record an
-    EngineVersion. The image is not loaded/run here — that's the M6 follow-up.
+    The push itself was authorized per-scope by the registry token endpoint;
+    this just find-or-creates the Engine and stores the image coordinates
+    (repository + digest) as an EngineVersion. Loading/running the image during
+    games is the M6 follow-up.
     """
-    name = name.strip()
-    version = version.strip()
-    if not name or not version:
-        raise ConflictError("name and version are required")
+    name = payload.name.strip()
+    version = payload.version.strip()
+    repository = payload.repository.strip().lower()
+    digest = payload.digest.strip()
+    if not (name and version and repository and digest):
+        raise ConflictError("name, version, repository and digest are required")
+
+    # Defense in depth: the token issuer only grants push under the user's own
+    # namespace, but re-check here so a leaked token can't register an image
+    # under someone else's name.
+    namespace = user.login.lower()
+    if repository.split("/", 1)[0] != namespace:
+        raise ConflictError(f"repository must be namespaced under {namespace!r}")
 
     engine = await Engine.find_one(Engine.owner_id == user.id, Engine.name == name)
     if engine is None:
@@ -114,35 +117,23 @@ async def upload_engine(
             f"version {version!r} already exists for {user.login}/{name}"
         )
 
-    version_id = uuid4()
-    rel_path = f"engines/{version_id}.tar"
-    dest = settings.storage_dir / rel_path
-    dest.parent.mkdir(parents=True, exist_ok=True)
-
-    size = 0
-    try:
-        with dest.open("wb") as f:
-            while chunk := await image.read(_UPLOAD_CHUNK):
-                size += len(chunk)
-                if size > settings.max_upload_bytes:
-                    raise PayloadTooLargeError(
-                        f"image exceeds {settings.max_upload_bytes} bytes"
-                    )
-                f.write(chunk)
-    except BaseException:
-        dest.unlink(missing_ok=True)
-        raise
-
     doc = EngineVersion(
-        id=version_id,
         engine_id=engine.id,
         version=version,
-        file_path=rel_path,
-        size_bytes=size,
+        image_repository=repository,
+        image_digest=digest,
+        size_bytes=payload.size_bytes,
         image_name=name,
     )
     await doc.insert()
-    logger.info("stored %s/%s version=%s size=%d", user.login, name, version, size)
+    logger.info(
+        "registered %s/%s version=%s image=%s@%s",
+        user.login,
+        name,
+        version,
+        repository,
+        digest,
+    )
 
     return EngineUploadResponse(
         engine_id=engine.id,

@@ -12,6 +12,8 @@ The session itself lives in a signed cookie managed by Starlette's
 ``SessionMiddleware`` (wired up in ``app.main``).
 """
 
+import base64
+import binascii
 import hashlib
 import logging
 import secrets
@@ -22,10 +24,11 @@ import httpx
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import RedirectResponse
 
+from app import registry
 from app.config import settings
 from app.exceptions import AppException, AuthError
 from app.models import ApiToken, User, utcnow
-from app.schemas import TokenOut, UserOut
+from app.schemas import RegistryTokenOut, TokenOut, UserOut
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -39,20 +42,25 @@ def _hash_token(plaintext: str) -> str:
     return hashlib.sha256(plaintext.encode()).hexdigest()
 
 
+async def user_from_token(plaintext: str) -> User | None:
+    """Resolve a user from a plaintext API token, refreshing its last-used time."""
+    if not plaintext:
+        return None
+    token = await ApiToken.find_one(ApiToken.token_hash == _hash_token(plaintext))
+    if token is None:
+        return None
+    token.last_used_at = utcnow()
+    await token.save()
+    return await User.get(token.user_id)
+
+
 async def _user_from_bearer(request: Request) -> User | None:
     """Resolve a user from an ``Authorization: Bearer <token>`` header, or None."""
     header = request.headers.get("Authorization", "")
     scheme, _, plaintext = header.partition(" ")
     if scheme.lower() != "bearer" or not plaintext:
         return None
-
-    token = await ApiToken.find_one(ApiToken.token_hash == _hash_token(plaintext))
-    if token is None:
-        return None
-
-    token.last_used_at = utcnow()
-    await token.save()
-    return await User.get(token.user_id)
+    return await user_from_token(plaintext)
 
 
 async def get_current_user(request: Request) -> User | None:
@@ -182,3 +190,66 @@ async def create_token(user: User = Depends(require_user)) -> TokenOut:
 async def logout(request: Request) -> dict[str, bool]:
     request.session.clear()
     return {"success": True}
+
+
+def _basic_password(request: Request) -> str | None:
+    """Return the password from an ``Authorization: Basic`` header, or None."""
+    header = request.headers.get("Authorization", "")
+    scheme, _, encoded = header.partition(" ")
+    if scheme.lower() != "basic" or not encoded:
+        return None
+    try:
+        decoded = base64.b64decode(encoded).decode("utf-8")
+    except (binascii.Error, UnicodeDecodeError):
+        return None
+    _, _, password = decoded.partition(":")
+    return password or None
+
+
+@router.get("/registry/token", response_model=RegistryTokenOut)
+async def registry_token(request: Request) -> RegistryTokenOut:
+    """Docker Registry v2 token endpoint (the registry's `auth.token.realm`).
+
+    Authenticates the ``mp_`` token sent as the HTTP Basic password (written by
+    ``machineplay login``) and mints a signed JWT granting the requested scopes:
+    ``pull`` is always allowed (engines are public); ``push`` only when the
+    repository is namespaced under the authenticated user's login.
+    """
+    password = _basic_password(request)
+    user: User | None = None
+    if password is not None:
+        user = await user_from_token(password)
+        if user is None:
+            # docker login surfaces this as an auth failure.
+            raise AuthError("invalid registry credentials")
+
+    namespace = user.login.lower() if user else None
+    granted: list[registry.Access] = []
+    for scope in request.query_params.getlist("scope"):
+        access = registry.parse_scope(scope)
+        if access is None:
+            continue
+        repo_ns = access.name.split("/", 1)[0]
+        actions: list[str] = []
+        if "pull" in access.actions or "*" in access.actions:
+            actions.append("pull")
+        if (
+            ("push" in access.actions or "*" in access.actions)
+            and namespace is not None
+            and repo_ns == namespace
+        ):
+            actions.append("push")
+        if actions:
+            granted.append(
+                registry.Access(type=access.type, name=access.name, actions=actions)
+            )
+
+    token, ttl = registry.make_token(
+        subject=user.login if user else "", granted=granted
+    )
+    return RegistryTokenOut(
+        token=token,
+        access_token=token,
+        expires_in=ttl,
+        issued_at=utcnow().isoformat(),
+    )

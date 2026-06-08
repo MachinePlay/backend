@@ -39,9 +39,15 @@ class Engine(UUIDDocument):
 class EngineVersion(UUIDDocument):
     engine_id: UUID
     version: str
-    # Path to the `docker save` tarball, relative to settings.storage_dir.
-    file_path: str
-    size_bytes: int
+    # Engines are pushed to the docker registry: image_repository is the repo
+    # path (e.g. "alice/myengine"), image_digest pins the exact image. The
+    # runner pulls `{registry_host}/{image_repository}@{image_digest}`.
+    image_repository: str | None = None
+    image_digest: str | None = None
+    # Legacy `docker save` tarball path (relative to the old storage dir), kept
+    # nullable for versions uploaded before the registry transport.
+    file_path: str | None = None
+    size_bytes: int = 0
     # Engine name read from the UCI `id name` reply at upload time.
     image_name: str | None = None
     created_at: datetime = Field(default_factory=utcnow)

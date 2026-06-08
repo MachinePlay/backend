@@ -26,7 +26,7 @@ from app.schemas import (
     EngineDetailOut,
     EngineOut,
     EngineRegisterRequest,
-    EngineUploadResponse,
+    EngineRegisterResponse,
     EngineVersionOut,
     GameOut,
     LiveStreamEvent,
@@ -77,11 +77,11 @@ async def get_engine(engine_id: UUID) -> EngineDetailOut:
     )
 
 
-@router.post("/engine/register", response_model=EngineUploadResponse)
+@router.post("/engine/register", response_model=EngineRegisterResponse)
 async def register_engine(
     payload: EngineRegisterRequest,
     user: User = Depends(require_token_user),
-) -> EngineUploadResponse:
+) -> EngineRegisterResponse:
     """Record an engine version after the CLI pushed its image to the registry.
 
     The push itself was authorized per-scope by the registry token endpoint;
@@ -135,7 +135,7 @@ async def register_engine(
         digest,
     )
 
-    return EngineUploadResponse(
+    return EngineRegisterResponse(
         engine_id=engine.id,
         name=name,
         owner_login=user.login,

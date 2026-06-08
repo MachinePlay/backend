@@ -31,12 +31,6 @@ class ConflictError(AppException):
     message = "Resource already exists"
 
 
-class PayloadTooLargeError(AppException):
-    status_code = 413
-    code = "payload_too_large"
-    message = "Upload is too large"
-
-
 class RunnerBusyError(AppException):
     status_code = 503
     code = "runner_busy"

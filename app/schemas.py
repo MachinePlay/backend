@@ -81,7 +81,7 @@ class EngineRegisterRequest(BaseModel):
     size_bytes: int = 0
 
 
-class EngineUploadResponse(BaseModel):
+class EngineRegisterResponse(BaseModel):
     engine_id: UUID
     name: str
     owner_login: str | None

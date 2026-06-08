@@ -26,6 +26,14 @@ class Settings(BaseSettings):
     registry_auth_key_file: Path | None = Field(
         default=None, validation_alias="REGISTRY_AUTH_KEY_FILE"
     )
+    # The signing cert (PEM), embedded in each token's `x5c` header so the
+    # registry can verify it against its rootcertbundle. distribution v3 does
+    # NOT build its `kid` trust-set from the rootcertbundle, so x5c (not kid) is
+    # what actually gets the token trusted. Provide inline or by path.
+    registry_auth_cert: str = Field(default="", validation_alias="REGISTRY_AUTH_CERT")
+    registry_auth_cert_file: Path | None = Field(
+        default=None, validation_alias="REGISTRY_AUTH_CERT_FILE"
+    )
     # How long an issued registry token is valid (seconds).
     registry_token_ttl: int = Field(default=300, validation_alias="REGISTRY_TOKEN_TTL")
 

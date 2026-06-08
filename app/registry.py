@@ -29,6 +29,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 
 import jwt
+from cryptography import x509
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.rsa import RSAPrivateKey
 
@@ -70,10 +71,29 @@ def _libtrust_kid(key: RSAPrivateKey) -> str:
     return ":".join(b32[i : i + 4] for i in range(0, len(b32), 4))
 
 
+def _load_cert_x5c() -> str | None:
+    """Return the signing cert as a base64 (std) DER string for the `x5c` header.
+
+    Optional: without it the token falls back to a bare `kid`, which the registry
+    will reject under distribution v3 (its kid trust-set isn't fed from the
+    rootcertbundle). Required in production.
+    """
+    if settings.registry_auth_cert_file is not None:
+        pem = settings.registry_auth_cert_file.read_bytes()
+    elif settings.registry_auth_cert:
+        pem = settings.registry_auth_cert.encode()
+    else:
+        return None
+    cert = x509.load_pem_x509_certificate(pem)
+    return base64.b64encode(cert.public_bytes(serialization.Encoding.DER)).decode(
+        "ascii"
+    )
+
+
 @lru_cache(maxsize=1)
-def _signer() -> tuple[RSAPrivateKey, str]:
+def _signer() -> tuple[RSAPrivateKey, str, str | None]:
     key = _load_private_key()
-    return key, _libtrust_kid(key)
+    return key, _libtrust_kid(key), _load_cert_x5c()
 
 
 def parse_scope(scope: str) -> Access | None:
@@ -95,7 +115,7 @@ def parse_scope(scope: str) -> Access | None:
 
 def make_token(subject: str, granted: list[Access]) -> tuple[str, int]:
     """Sign a registry JWT for `subject` granting `granted`. Returns (jwt, ttl)."""
-    key, kid = _signer()
+    key, kid, x5c = _signer()
     now = int(time.time())
     ttl = settings.registry_token_ttl
     claims = {
@@ -110,5 +130,11 @@ def make_token(subject: str, granted: list[Access]) -> tuple[str, int]:
             {"type": a.type, "name": a.name, "actions": a.actions} for a in granted
         ],
     }
-    token = jwt.encode(claims, key, algorithm="RS256", headers={"kid": kid})
+    # x5c carries the signing cert so the registry verifies it against its
+    # rootcertbundle (the path distribution v3 actually trusts); kid is kept as a
+    # fallback for v2-style servers.
+    headers: dict[str, object] = {"kid": kid}
+    if x5c is not None:
+        headers["x5c"] = [x5c]
+    token = jwt.encode(claims, key, algorithm="RS256", headers=headers)
     return token, ttl

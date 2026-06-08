@@ -43,7 +43,6 @@ class EngineOut(BaseModel):
 
     id: UUID
     name: str
-    command: str
     description: str
     owner_login: str | None = None
     version_count: int = 0
@@ -55,8 +54,8 @@ class EngineVersionOut(BaseModel):
     id: UUID
     version: str
     size_bytes: int
-    image_repository: str | None = None
-    image_digest: str | None = None
+    image_repository: str
+    image_digest: str
     created_at: datetime
 
 

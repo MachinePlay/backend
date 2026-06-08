@@ -19,9 +19,6 @@ class UUIDDocument(Document):
 
 class Engine(UUIDDocument):
     name: str
-    # Uploaded engines are run from a Docker image (see EngineVersion) and have
-    # no shell command yet; only seeded/system engines (e.g. stockfish) set it.
-    command: str = ""
     description: str = ""
     # Owner is None for seeded/system engines. Uploaded engines are namespaced
     # per owner: (owner_id, name) is unique. owner_login is denormalized for
@@ -42,11 +39,8 @@ class EngineVersion(UUIDDocument):
     # Engines are pushed to the docker registry: image_repository is the repo
     # path (e.g. "alice/myengine"), image_digest pins the exact image. The
     # runner pulls `{registry_host}/{image_repository}@{image_digest}`.
-    image_repository: str | None = None
-    image_digest: str | None = None
-    # Legacy `docker save` tarball path (relative to the old storage dir), kept
-    # nullable for versions uploaded before the registry transport.
-    file_path: str | None = None
+    image_repository: str
+    image_digest: str
     size_bytes: int = 0
     # Engine name read from the UCI `id name` reply at upload time.
     image_name: str | None = None

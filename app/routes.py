@@ -44,10 +44,18 @@ async def _engine_to_out(engine: Engine) -> EngineOut:
     return EngineOut(
         id=engine.id,
         name=engine.name,
-        command=engine.command,
         description=engine.description,
         owner_login=engine.owner_login,
         version_count=count,
+    )
+
+
+async def _latest_version(engine_id: UUID) -> EngineVersion | None:
+    """The most recently uploaded image version for an engine, or None."""
+    return (
+        await EngineVersion.find(EngineVersion.engine_id == engine_id)
+        .sort("-created_at")
+        .first_or_none()
     )
 
 
@@ -159,6 +167,14 @@ async def start_game(
     if white is None or black is None:
         raise NotFoundError("engine not found")
 
+    # Engines play from their latest uploaded image; reject if either has none.
+    white_version = await _latest_version(white.id)
+    black_version = await _latest_version(black.id)
+    if white_version is None:
+        raise NotFoundError(f"engine {white.name!r} has no uploaded image to play")
+    if black_version is None:
+        raise NotFoundError(f"engine {black.name!r} has no uploaded image to play")
+
     runner = streaming.runners.get_runner(payload.runner_id)
 
     if runner.is_full():
@@ -184,8 +200,16 @@ async def start_game(
     await runner.scheduled_commands.put(
         schemas.StartGame(
             game_id=doc.id,
-            white=schemas.EngineConfig(name=white.name, command=white.command),
-            black=schemas.EngineConfig(name=black.name, command=black.command),
+            white=schemas.EngineConfig(
+                name=white.name,
+                repository=white_version.image_repository,
+                digest=white_version.image_digest,
+            ),
+            black=schemas.EngineConfig(
+                name=black.name,
+                repository=black_version.image_repository,
+                digest=black_version.image_digest,
+            ),
             tc=settings.tc,
         )
     )

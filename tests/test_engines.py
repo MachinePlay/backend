@@ -13,8 +13,8 @@ async def test_list_engines_empty() -> None:
 
 
 async def test_list_engines_returns_inserted() -> None:
-    await Engine(name="stockfish", command="stockfish", description="sf").insert()
-    await Engine(name="lc0", command="lc0").insert()
+    await Engine(name="stockfish", description="sf").insert()
+    await Engine(name="lc0").insert()
 
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
@@ -24,5 +24,4 @@ async def test_list_engines_returns_inserted() -> None:
     body = response.json()
     assert {e["name"] for e in body} == {"stockfish", "lc0"}
     sf = next(e for e in body if e["name"] == "stockfish")
-    assert sf["command"] == "stockfish"
     assert sf["description"] == "sf"

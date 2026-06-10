@@ -75,6 +75,9 @@ class Game(UUIDDocument):
     black_id: UUID
     white_name: str
     black_name: str
+    # Which uploaded version each side played (None on games predating this).
+    white_version: str | None = None
+    black_version: str | None = None
     status: GameStatus = GameStatus.PLAYING
     result: str | None = None
     moves: list[str] = Field(default_factory=list)

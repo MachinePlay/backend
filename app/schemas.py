@@ -10,6 +10,9 @@ class StartGameRequest(BaseModel):
     white_engine_id: UUID
     black_engine_id: UUID
     runner_id: UUID
+    # Specific uploaded versions to play; defaults to each engine's latest.
+    white_version_id: UUID | None = None
+    black_version_id: UUID | None = None
 
 
 class StartGameResponse(BaseModel):
@@ -136,6 +139,8 @@ class GameOut(BaseModel):
     black_id: UUID
     white_name: str
     black_name: str
+    white_version: str | None
+    black_version: str | None
     status: GameStatus
     result: str | None
     moves: list[str]

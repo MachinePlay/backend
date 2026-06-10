@@ -66,6 +66,19 @@ async def _latest_version(engine_id: UUID) -> EngineVersion | None:
     )
 
 
+async def _resolve_version(engine: Engine, version_id: UUID | None) -> EngineVersion:
+    """The requested uploaded version of `engine`, or its latest when None."""
+    if version_id is None:
+        version = await _latest_version(engine.id)
+        if version is None:
+            raise NotFoundError(f"engine {engine.name!r} has no uploaded image to play")
+        return version
+    version = await EngineVersion.get(version_id)
+    if version is None or version.engine_id != engine.id:
+        raise NotFoundError(f"engine {engine.name!r} has no such version")
+    return version
+
+
 @router.get("/engine", response_model=list[EngineOut])
 async def list_engines() -> list[EngineOut]:
     engines = await Engine.find_all().to_list()
@@ -232,13 +245,8 @@ async def start_game(
     if white is None or black is None:
         raise NotFoundError("engine not found")
 
-    # Engines play from their latest uploaded image; reject if either has none.
-    white_version = await _latest_version(white.id)
-    black_version = await _latest_version(black.id)
-    if white_version is None:
-        raise NotFoundError(f"engine {white.name!r} has no uploaded image to play")
-    if black_version is None:
-        raise NotFoundError(f"engine {black.name!r} has no uploaded image to play")
+    white_version = await _resolve_version(white, payload.white_version_id)
+    black_version = await _resolve_version(black, payload.black_version_id)
 
     runner = streaming.runners.get_runner(payload.runner_id)
 
@@ -256,6 +264,8 @@ async def start_game(
         black_id=black.id,
         white_name=white.name,
         black_name=black.name,
+        white_version=white_version.version,
+        black_version=black_version.version,
     )
     await doc.insert()
 

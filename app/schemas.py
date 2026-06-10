@@ -87,6 +87,7 @@ class EngineDetailOut(BaseModel):
     owner_login: str | None
     created_at: datetime
     versions: list[EngineVersionOut]
+    games: list["GameOut"]
 
 
 class EngineRegisterRequest(BaseModel):

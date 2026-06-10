@@ -40,6 +40,11 @@ from app.schemas import (
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
+# Engine names live in URLs (machineplay.org/{login}/{engine}) and docker
+# repository paths, so they are lowercase slugs: a-z/0-9 with single interior
+# separators (. _ -), max 64 chars.
+ENGINE_NAME_RE = re.compile(r"^[a-z0-9](?:[._-]?[a-z0-9]){0,63}$")
+
 
 async def _engine_to_out(engine: Engine) -> EngineOut:
     count = await EngineVersion.find(EngineVersion.engine_id == engine.id).count()
@@ -67,16 +72,31 @@ async def list_engines() -> list[EngineOut]:
     return [await _engine_to_out(e) for e in engines]
 
 
-@router.get("/engine/{engine_id}", response_model=EngineDetailOut)
-async def get_engine(engine_id: UUID) -> EngineDetailOut:
-    engine = await Engine.get(engine_id)
-    if engine is None:
-        raise NotFoundError("engine not found")
+async def _recent_games(engine_ids: list[UUID], limit: int = 20) -> list[Game]:
+    if not engine_ids:
+        return []
+    return (
+        await Game.find(
+            {
+                "$or": [
+                    {"white_id": {"$in": engine_ids}},
+                    {"black_id": {"$in": engine_ids}},
+                ]
+            }
+        )
+        .sort("-created_at")
+        .limit(limit)
+        .to_list()
+    )
+
+
+async def _engine_detail(engine: Engine) -> EngineDetailOut:
     versions = (
-        await EngineVersion.find(EngineVersion.engine_id == engine_id)
+        await EngineVersion.find(EngineVersion.engine_id == engine.id)
         .sort("-created_at")
         .to_list()
     )
+    games = await _recent_games([engine.id])
     return EngineDetailOut(
         id=engine.id,
         name=engine.name,
@@ -84,7 +104,16 @@ async def get_engine(engine_id: UUID) -> EngineDetailOut:
         owner_login=engine.owner_login,
         created_at=engine.created_at,
         versions=[EngineVersionOut.model_validate(v) for v in versions],
+        games=[GameOut.model_validate(g) for g in games],
     )
+
+
+@router.get("/engine/{engine_id}", response_model=EngineDetailOut)
+async def get_engine(engine_id: UUID) -> EngineDetailOut:
+    engine = await Engine.get(engine_id)
+    if engine is None:
+        raise NotFoundError("engine not found")
+    return await _engine_detail(engine)
 
 
 @router.post("/engine/register", response_model=EngineRegisterResponse)
@@ -99,12 +128,17 @@ async def register_engine(
     (repository + digest) as an EngineVersion. Loading/running the image during
     games is the M6 follow-up.
     """
-    name = payload.name.strip()
+    name = payload.name.strip().lower()
     version = payload.version.strip()
     repository = payload.repository.strip().lower()
     digest = payload.digest.strip()
     if not (name and version and repository and digest):
         raise ConflictError("name, version, repository and digest are required")
+    if not ENGINE_NAME_RE.fullmatch(name):
+        raise ConflictError(
+            "engine name must be 1-64 characters: a-z, 0-9 and single "
+            "interior separators (. _ -)"
+        )
 
     # Defense in depth: the token issuer only grants push under the user's own
     # namespace, but re-check here so a leaked token can't register an image
@@ -150,37 +184,25 @@ async def register_engine(
         name=name,
         owner_login=user.login,
         version=version,
-        url=f"{settings.frontend_url}/engine/{engine.id}",
+        url=f"{settings.frontend_url}/{user.login}/{engine.name}",
     )
 
 
-@router.get("/u/{login}", response_model=UserProfileOut)
-async def user_profile(login: str) -> UserProfileOut:
-    """Public profile: the user, their engines, and those engines' games."""
+async def _user_by_login(login: str) -> User:
     user = await User.find_one(
         {"login": {"$regex": f"^{re.escape(login)}$", "$options": "i"}}
     )
     if user is None:
         raise NotFoundError("user not found")
+    return user
 
+
+@router.get("/u/{login}", response_model=UserProfileOut)
+async def user_profile(login: str) -> UserProfileOut:
+    """Public profile: the user, their engines, and those engines' games."""
+    user = await _user_by_login(login)
     engines = await Engine.find(Engine.owner_id == user.id).to_list()
-    engine_ids = [e.id for e in engines]
-    games = []
-    if engine_ids:
-        games = (
-            await Game.find(
-                {
-                    "$or": [
-                        {"white_id": {"$in": engine_ids}},
-                        {"black_id": {"$in": engine_ids}},
-                    ]
-                }
-            )
-            .sort("-created_at")
-            .limit(20)
-            .to_list()
-        )
-
+    games = await _recent_games([e.id for e in engines])
     return UserProfileOut(
         login=user.login,
         name=user.name,
@@ -189,6 +211,19 @@ async def user_profile(login: str) -> UserProfileOut:
         engines=[await _engine_to_out(e) for e in engines],
         games=[GameOut.model_validate(g) for g in games],
     )
+
+
+@router.get("/u/{login}/{engine_name}", response_model=EngineDetailOut)
+async def get_engine_by_name(login: str, engine_name: str) -> EngineDetailOut:
+    """Engine detail addressed GitHub-style: owner handle + engine name."""
+    user = await _user_by_login(login)
+    engine = await Engine.find_one(
+        Engine.owner_id == user.id,
+        {"name": {"$regex": f"^{re.escape(engine_name)}$", "$options": "i"}},
+    )
+    if engine is None:
+        raise NotFoundError("engine not found")
+    return await _engine_detail(engine)
 
 
 @router.get("/runners", response_model=list[RunnerOut])

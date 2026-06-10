@@ -54,9 +54,38 @@ GITHUB_TOKEN_URL = "https://github.com/login/oauth/access_token"
 GITHUB_USER_URL = "https://api.github.com/user"
 
 # Handles are lowercase, 1-32 chars of [a-z0-9] with single interior hyphens.
-# They double as the user's docker-registry namespace and /u/{login} URL.
+# They double as the user's docker-registry namespace and their profile URL,
+# which lives at the frontend root (machineplay.org/{login}) — so every
+# top-level frontend route and API-ish name must be reserved.
 HANDLE_RE = re.compile(r"^[a-z0-9](?:-?[a-z0-9]){0,31}$")
-RESERVED_HANDLES = {"machineplay", "admin", "api", "registry", "www"}
+RESERVED_HANDLES = {
+    # frontend routes
+    "about",
+    "cli",
+    "engine",
+    "game",
+    "register",
+    "tournament",
+    "u",
+    # api / infra
+    "admin",
+    "api",
+    "assets",
+    "auth",
+    "blog",
+    "docs",
+    "help",
+    "login",
+    "logout",
+    "machineplay",
+    "me",
+    "registry",
+    "runners",
+    "settings",
+    "static",
+    "stream",
+    "www",
+}
 
 
 async def _handle_taken(login: str) -> User | None:

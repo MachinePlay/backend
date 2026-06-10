@@ -124,3 +124,62 @@ async def test_user_profile() -> None:
     assert body["login"] == "profiled"
     assert [e["name"] for e in body["engines"]] == ["bot"]
     assert len(body["games"]) == 1
+
+
+async def test_engine_by_name() -> None:
+    user = await User(github_id=10, login="owner").insert()
+    engine = await Engine(
+        name="my-bot", owner_id=user.id, owner_login=user.login
+    ).insert()
+    await Game(
+        white_id=engine.id,
+        black_id=engine.id,
+        white_name="my-bot",
+        black_name="my-bot",
+    ).insert()
+
+    async with _client() as client:
+        resp = await client.get("/u/OWNER/MY-BOT")  # case-insensitive
+        missing = await client.get("/u/owner/no-such-engine")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["name"] == "my-bot"
+    assert body["owner_login"] == "owner"
+    assert len(body["games"]) == 1
+    assert missing.status_code == 404
+
+
+async def test_register_engine_rejects_bad_names() -> None:
+    user = await User(github_id=11, login="uploader").insert()
+    token = await mint_token(user)
+    headers = {"Authorization": f"Bearer {token}"}
+
+    async with _client() as client:
+        for bad in ["-bot", "bot-", "bo..t", "bot!", "a" * 65]:
+            resp = await client.post(
+                "/engine/register",
+                headers=headers,
+                json={
+                    "name": bad,
+                    "version": "v1",
+                    "repository": "uploader/bot",
+                    "digest": "sha256:abc",
+                },
+            )
+            assert resp.status_code == 409, bad
+
+        # Names are lowercased, not rejected, on case mismatch.
+        ok = await client.post(
+            "/engine/register",
+            headers=headers,
+            json={
+                "name": "MyBot",
+                "version": "v1",
+                "repository": "uploader/mybot",
+                "digest": "sha256:abc",
+            },
+        )
+    assert ok.status_code == 200
+    body = ok.json()
+    assert body["name"] == "mybot"
+    assert body["url"].endswith("/uploader/mybot")

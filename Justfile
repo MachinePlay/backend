@@ -17,3 +17,6 @@ gen-api:
 deploy:
     ssh root@machineplay.org deploy-machineplay-backend
 
+# Follow backend logs from the VPS.
+logs:
+    ssh -t root@machineplay.org 'journalctl -u machineplay -n 200 -f'

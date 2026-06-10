@@ -139,8 +139,8 @@ class GameOut(BaseModel):
     black_id: UUID
     white_name: str
     black_name: str
-    white_version: str | None
-    black_version: str | None
+    white_version: str
+    black_version: str
     status: GameStatus
     result: str | None
     moves: list[str]

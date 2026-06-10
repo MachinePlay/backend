@@ -113,6 +113,8 @@ async def test_user_profile() -> None:
         black_id=engine.id,
         white_name="bot",
         black_name="bot",
+        white_version="v1",
+        black_version="v1",
     ).insert()
 
     async with _client() as client:
@@ -136,6 +138,8 @@ async def test_engine_by_name() -> None:
         black_id=engine.id,
         white_name="my-bot",
         black_name="my-bot",
+        white_version="v1",
+        black_version="v1",
     ).insert()
 
     async with _client() as client:

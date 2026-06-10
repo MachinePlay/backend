@@ -14,6 +14,8 @@ async def _make_game() -> Game:
         black_id=uuid4(),
         white_name="white",
         black_name="black",
+        white_version="v1",
+        black_version="v1",
     )
     await g.insert()
     return g

@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import re
 from collections.abc import AsyncIterable
 from uuid import UUID
 
@@ -33,6 +34,7 @@ from app.schemas import (
     RunnerOut,
     StartGameRequest,
     StartGameResponse,
+    UserProfileOut,
 )
 
 logger = logging.getLogger(__name__)
@@ -149,6 +151,43 @@ async def register_engine(
         owner_login=user.login,
         version=version,
         url=f"{settings.frontend_url}/engine/{engine.id}",
+    )
+
+
+@router.get("/u/{login}", response_model=UserProfileOut)
+async def user_profile(login: str) -> UserProfileOut:
+    """Public profile: the user, their engines, and those engines' games."""
+    user = await User.find_one(
+        {"login": {"$regex": f"^{re.escape(login)}$", "$options": "i"}}
+    )
+    if user is None:
+        raise NotFoundError("user not found")
+
+    engines = await Engine.find(Engine.owner_id == user.id).to_list()
+    engine_ids = [e.id for e in engines]
+    games = []
+    if engine_ids:
+        games = (
+            await Game.find(
+                {
+                    "$or": [
+                        {"white_id": {"$in": engine_ids}},
+                        {"black_id": {"$in": engine_ids}},
+                    ]
+                }
+            )
+            .sort("-created_at")
+            .limit(20)
+            .to_list()
+        )
+
+    return UserProfileOut(
+        login=user.login,
+        name=user.name,
+        avatar_url=user.avatar_url,
+        created_at=user.created_at,
+        engines=[await _engine_to_out(e) for e in engines],
+        games=[GameOut.model_validate(g) for g in games],
     )
 
 

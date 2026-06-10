@@ -4,9 +4,17 @@ Flow:
   1. Browser hits ``GET /auth/github/login`` → 302 to GitHub's consent screen
      (carrying a random ``state`` we stash in the session).
   2. GitHub redirects back to ``GET /auth/github/callback`` with ``code`` +
-     ``state``; we verify ``state``, exchange ``code`` for an access token,
-     fetch the GitHub profile, upsert a :class:`~app.models.User`, store its id
-     in the session, then 302 back to the frontend.
+     ``state``; we verify ``state``, exchange ``code`` for an access token and
+     fetch the GitHub profile.
+  3. A known ``github_id`` is logged straight in (its id goes in the session)
+     and 302s back to the frontend. An unknown one is NOT registered yet: the
+     profile is stashed in the session as ``pending_signup`` and the browser is
+     sent to the frontend's ``/register`` page, where the user picks a handle
+     (``GET /auth/pending`` shows the suggestion, ``POST /auth/register``
+     creates the :class:`~app.models.User`).
+
+The handle (``User.login``) is chosen once at registration — it is the user's
+registry namespace and profile URL, and is never overwritten from GitHub.
 
 The session itself lives in a signed cookie managed by Starlette's
 ``SessionMiddleware`` (wired up in ``app.main``).
@@ -16,6 +24,7 @@ import base64
 import binascii
 import hashlib
 import logging
+import re
 import secrets
 from urllib.parse import urlencode
 from uuid import UUID
@@ -26,9 +35,16 @@ from fastapi.responses import RedirectResponse
 
 from app import registry
 from app.config import settings
-from app.exceptions import AppException, AuthError
+from app.exceptions import AppException, AuthError, ConflictError, NotFoundError
 from app.models import ApiToken, User, utcnow
-from app.schemas import RegistryTokenOut, TokenOut, UserOut
+from app.schemas import (
+    ApiTokenOut,
+    PendingSignupOut,
+    RegisterRequest,
+    RegistryTokenOut,
+    TokenOut,
+    UserOut,
+)
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -36,6 +52,18 @@ router = APIRouter()
 GITHUB_AUTHORIZE_URL = "https://github.com/login/oauth/authorize"
 GITHUB_TOKEN_URL = "https://github.com/login/oauth/access_token"
 GITHUB_USER_URL = "https://api.github.com/user"
+
+# Handles are lowercase, 1-32 chars of [a-z0-9] with single interior hyphens.
+# They double as the user's docker-registry namespace and /u/{login} URL.
+HANDLE_RE = re.compile(r"^[a-z0-9](?:-?[a-z0-9]){0,31}$")
+RESERVED_HANDLES = {"machineplay", "admin", "api", "registry", "www"}
+
+
+async def _handle_taken(login: str) -> User | None:
+    """Case-insensitive lookup so e.g. 'saegl' can't shadow 'Saegl'."""
+    return await User.find_one(
+        {"login": {"$regex": f"^{re.escape(login)}$", "$options": "i"}}
+    )
 
 
 def _hash_token(plaintext: str) -> str:
@@ -154,23 +182,72 @@ async def github_callback(request: Request, code: str, state: str) -> RedirectRe
 
     user = await User.find_one(User.github_id == gh["id"])
     if user is None:
-        user = User(
-            github_id=gh["id"],
-            login=gh["login"],
-            name=gh.get("name"),
-            avatar_url=gh.get("avatar_url", ""),
-        )
-        await user.insert()
-        logger.info("registered new user login=%s id=%s", user.login, user.id)
-    else:
-        # Refresh profile fields that may have changed on GitHub.
-        user.login = gh["login"]
-        user.name = gh.get("name")
-        user.avatar_url = gh.get("avatar_url", "")
-        await user.save()
+        # Unknown GitHub account: stash the profile and let the user pick a
+        # handle on the frontend's /register page before creating anything.
+        request.session["pending_signup"] = {
+            "github_id": gh["id"],
+            "login": gh["login"],
+            "name": gh.get("name"),
+            "avatar_url": gh.get("avatar_url", ""),
+        }
+        return RedirectResponse(f"{settings.frontend_url}/register")
+
+    # Refresh profile fields that may have changed on GitHub. The handle
+    # (login) is chosen at registration and never overwritten.
+    user.name = gh.get("name")
+    user.avatar_url = gh.get("avatar_url", "")
+    await user.save()
 
     request.session["user_id"] = str(user.id)
     return RedirectResponse(settings.frontend_url)
+
+
+@router.get("/auth/pending", response_model=PendingSignupOut)
+async def pending_signup(request: Request) -> PendingSignupOut:
+    """The GitHub profile waiting on a handle, for the /register page."""
+    pending = request.session.get("pending_signup")
+    if not pending:
+        raise AuthError("no signup in progress")
+    return PendingSignupOut(
+        suggested_login=pending["login"].lower(),
+        name=pending.get("name"),
+        avatar_url=pending.get("avatar_url", ""),
+    )
+
+
+@router.post("/auth/register", response_model=UserOut)
+async def register(request: Request, payload: RegisterRequest) -> User:
+    """Complete a pending GitHub signup with the chosen handle."""
+    pending = request.session.get("pending_signup")
+    if not pending:
+        raise AuthError("no signup in progress")
+
+    # The GitHub account may have completed registration in another tab while
+    # this signup was pending; if so just log it in.
+    user = await User.find_one(User.github_id == pending["github_id"])
+    if user is None:
+        login = payload.login.strip().lower()
+        if not HANDLE_RE.fullmatch(login):
+            raise ConflictError(
+                "handle must be 1-32 characters: a-z, 0-9 and single hyphens, "
+                "starting and ending with a letter or digit"
+            )
+        if login in RESERVED_HANDLES:
+            raise ConflictError(f"handle {login!r} is reserved")
+        if await _handle_taken(login) is not None:
+            raise ConflictError(f"handle {login!r} is already taken")
+        user = User(
+            github_id=pending["github_id"],
+            login=login,
+            name=pending.get("name"),
+            avatar_url=pending.get("avatar_url", ""),
+        )
+        await user.insert()
+        logger.info("registered new user login=%s id=%s", user.login, user.id)
+
+    request.session.pop("pending_signup", None)
+    request.session["user_id"] = str(user.id)
+    return user
 
 
 @router.get("/me", response_model=UserOut)
@@ -184,6 +261,26 @@ async def create_token(user: User = Depends(require_user)) -> TokenOut:
     plaintext = await mint_token(user)
     logger.info("minted api token for user=%s", user.login)
     return TokenOut(token=plaintext)
+
+
+@router.get("/me/tokens", response_model=list[ApiTokenOut])
+async def list_tokens(user: User = Depends(require_user)) -> list[ApiToken]:
+    """The logged-in user's API tokens (prefix + timestamps, never plaintext)."""
+    return (
+        await ApiToken.find(ApiToken.user_id == user.id).sort("-created_at").to_list()
+    )
+
+
+@router.delete("/me/tokens/{token_id}")
+async def revoke_token(
+    token_id: UUID, user: User = Depends(require_user)
+) -> dict[str, bool]:
+    token = await ApiToken.get(token_id)
+    if token is None or token.user_id != user.id:
+        raise NotFoundError("token not found")
+    await token.delete()
+    logger.info("revoked api token %s for user=%s", token.prefix, user.login)
+    return {"success": True}
 
 
 @router.post("/auth/logout")

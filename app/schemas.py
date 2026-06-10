@@ -38,6 +38,27 @@ class UserOut(BaseModel):
     created_at: datetime
 
 
+class PendingSignupOut(BaseModel):
+    """The in-progress GitHub signup waiting for the user to pick a handle."""
+
+    suggested_login: str
+    name: str | None
+    avatar_url: str
+
+
+class RegisterRequest(BaseModel):
+    login: str
+
+
+class ApiTokenOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    prefix: str
+    created_at: datetime
+    last_used_at: datetime | None
+
+
 class EngineOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -123,3 +144,14 @@ class GameOut(BaseModel):
     black_clock: float
     created_at: datetime
     ended_at: datetime | None
+
+
+class UserProfileOut(BaseModel):
+    """Public profile: the user plus their engines and those engines' games."""
+
+    login: str
+    name: str | None
+    avatar_url: str
+    created_at: datetime
+    engines: list[EngineOut]
+    games: list[GameOut]

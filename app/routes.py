@@ -108,14 +108,6 @@ async def _engine_detail(engine: Engine) -> EngineDetailOut:
     )
 
 
-@router.get("/engine/{engine_id}", response_model=EngineDetailOut)
-async def get_engine(engine_id: UUID) -> EngineDetailOut:
-    engine = await Engine.get(engine_id)
-    if engine is None:
-        raise NotFoundError("engine not found")
-    return await _engine_detail(engine)
-
-
 @router.post("/engine/register", response_model=EngineRegisterResponse)
 async def register_engine(
     payload: EngineRegisterRequest,
@@ -167,7 +159,6 @@ async def register_engine(
         image_repository=repository,
         image_digest=digest,
         size_bytes=payload.size_bytes,
-        image_name=name,
     )
     await doc.insert()
     logger.info(

@@ -65,7 +65,7 @@ class EngineOut(BaseModel):
     id: UUID
     name: str
     description: str
-    owner_login: str | None = None
+    owner_login: str
     version_count: int = 0
 
 
@@ -84,14 +84,14 @@ class EngineDetailOut(BaseModel):
     id: UUID
     name: str
     description: str
-    owner_login: str | None
+    owner_login: str
     created_at: datetime
     versions: list[EngineVersionOut]
     games: list["GameOut"]
 
 
 class EngineRegisterRequest(BaseModel):
-    # Display name read from the engine's UCI `id name` reply.
+    # URL-safe engine name chosen at upload (machineplay.org/{login}/{name}).
     name: str
     version: str
     # Docker repository the CLI pushed to, e.g. "alice/myengine" (no host/tag).
@@ -105,7 +105,7 @@ class EngineRegisterRequest(BaseModel):
 class EngineRegisterResponse(BaseModel):
     engine_id: UUID
     name: str
-    owner_login: str | None
+    owner_login: str
     version: str
     url: str
 

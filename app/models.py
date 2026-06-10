@@ -20,11 +20,10 @@ class UUIDDocument(Document):
 class Engine(UUIDDocument):
     name: str
     description: str = ""
-    # Owner is None for seeded/system engines. Uploaded engines are namespaced
-    # per owner: (owner_id, name) is unique. owner_login is denormalized for
-    # display, mirroring how Game stores white_name/black_name.
-    owner_id: UUID | None = None
-    owner_login: str | None = None
+    # Engines are namespaced per owner: (owner_id, name) is unique. owner_login
+    # is denormalized for display, mirroring how Game stores white_name/black_name.
+    owner_id: UUID
+    owner_login: str
     created_at: datetime = Field(default_factory=utcnow)
 
     class Settings:
@@ -42,8 +41,6 @@ class EngineVersion(UUIDDocument):
     image_repository: str
     image_digest: str
     size_bytes: int = 0
-    # Engine name read from the UCI `id name` reply at upload time.
-    image_name: str | None = None
     created_at: datetime = Field(default_factory=utcnow)
 
     class Settings:

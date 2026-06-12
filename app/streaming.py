@@ -1,14 +1,34 @@
 import asyncio
 import logging
+from collections.abc import AsyncIterator
 from uuid import UUID
+
+from fastapi import WebSocket, WebSocketDisconnect
 
 from machineplay import schemas
 from machineplay.schemas import GameStatus
 
 from app.exceptions import NotFoundError
 from app.models import Game as GameDoc, utcnow
+from app.schemas import LiveStreamEvent
 
 logger = logging.getLogger(__name__)
+
+
+def _snapshot_event(doc: GameDoc) -> schemas.FenEvent:
+    """A FenEvent carrying the full current state of `doc`, for bootstrapping."""
+    return schemas.FenEvent(
+        fen=doc.fen,
+        ply=len(doc.moves),
+        white_name=doc.white_name,
+        black_name=doc.black_name,
+        moves=doc.moves,
+        white_clock=doc.white_clock,
+        black_clock=doc.black_clock,
+        result=doc.result,
+        status=doc.status,
+        game_id=doc.id,
+    )
 
 
 async def abort_game(game_id: UUID) -> None:
@@ -21,7 +41,7 @@ async def abort_game(game_id: UUID) -> None:
         await doc.save()
         logger.info("aborted game=%s", game_id)
 
-    game = game_registry.registry.pop(game_id, None)
+    game = game_registry.unregister(game_id)
     if game is not None:
         end_event = schemas.GameEndEvent(result="*", pgn=None)
         await game.broadcast(end_event)
@@ -154,21 +174,7 @@ class LiveStream:
             if doc is None or doc.status != GameStatus.PLAYING:
                 continue
             self.tracked.add(gid)
-            self._fanout(
-                gid,
-                schemas.FenEvent(
-                    fen=doc.fen,
-                    ply=len(doc.moves),
-                    white_name=doc.white_name,
-                    black_name=doc.black_name,
-                    moves=doc.moves,
-                    white_clock=doc.white_clock,
-                    black_clock=doc.black_clock,
-                    result=doc.result,
-                    status=GameStatus.PLAYING,
-                    game_id=gid,
-                ),
-            )
+            self._fanout(gid, _snapshot_event(doc))
             return
 
     def _fanout(self, game_id: UUID, event: schemas.GameStreamEvent) -> None:
@@ -197,6 +203,9 @@ class GameRegistry:
             raise NotFoundError(
                 "game with this id not found", details={"game_id": str(game_id)}
             )
+
+    def unregister(self, game_id: UUID) -> Game | None:
+        return self.registry.pop(game_id, None)
 
 
 class Runner:
@@ -254,3 +263,117 @@ class Runners:
 game_registry = GameRegistry()
 live_stream = LiveStream()
 runners = Runners()
+
+
+async def runner_session(ws: WebSocket) -> None:
+    """Lifecycle of one connected runner: register it, pump game events from
+    the socket into persistence + fan-out, pump scheduled commands back, and
+    abort its games when it disconnects."""
+    await ws.accept()
+
+    intro = schemas.Introduction.model_validate_json(await ws.receive_text())
+    runner = runners.register_runner(
+        intro.runner_id, intro.name, max_games=intro.max_games
+    )
+    logger.info(
+        "runner connected id=%s name=%s max_games=%d",
+        intro.runner_id,
+        intro.name,
+        intro.max_games,
+    )
+
+    async def receiver() -> None:
+        while True:
+            data = await ws.receive_text()
+            cmd: schemas.ClientCommandType = schemas.client_adapter.validate_json(data)
+            match cmd:
+                case schemas.GameEvent(game_id=game_id, event=event):
+                    try:
+                        game = game_registry.get_game(game_id)
+                    except NotFoundError:
+                        logger.warning("event for unregistered game_id=%s", game_id)
+                        continue
+                    if isinstance(event, schemas.GameEndEvent):
+                        runner.untrack_game(game_id)
+                        game_registry.unregister(game_id)
+                    await persist_event(game_id, event)
+                    await game.broadcast(event)
+                    await live_stream.broadcast(game_id, event)
+
+    async def sender() -> None:
+        while True:
+            command = await runner.scheduled_commands.get()
+            await ws.send_text(command.model_dump_json())
+
+    recv_task = asyncio.create_task(receiver())
+    send_task = asyncio.create_task(sender())
+
+    try:
+        done, _ = await asyncio.wait(
+            {recv_task, send_task},
+            return_when=asyncio.FIRST_EXCEPTION,
+        )
+        for task in done:
+            task.result()  # re-raise exceptions
+    except WebSocketDisconnect:
+        logger.info("runner disconnected id=%s", intro.runner_id)
+    finally:
+        recv_task.cancel()
+        send_task.cancel()
+        await runner.abort_games()
+        runners.unregister_runner(intro.runner_id)
+
+
+async def game_event_stream(game_id: UUID) -> AsyncIterator[schemas.GameStreamEvent]:
+    """Event source for one game's SSE endpoint: snapshot, then live events."""
+    try:
+        game = game_registry.get_game(game_id)
+    except NotFoundError:
+        # Game is no longer live; if it exists in the DB, emit a single
+        # terminal event so late subscribers see a clean end rather than 404.
+        doc = await GameDoc.get(game_id)
+        if doc is None:
+            raise
+        yield schemas.GameEndEvent(result=doc.result, pgn=doc.pgn)
+        return
+
+    q = game.subscribe()
+    try:
+        # Subscribe-then-snapshot: the WS receiver writes the DB before
+        # broadcasting, so anything already in the snapshot is also (or about
+        # to be) in our queue. Dedup queued events by ply against the snapshot
+        # so the client sees each event exactly once.
+        doc = await GameDoc.get(game_id)
+        snapshot_ply = -1
+        if doc is not None:
+            snapshot_ply = len(doc.moves)
+            yield _snapshot_event(doc)
+
+        while True:
+            event = await q.get()
+            match event:
+                case schemas.GameStartEvent() if snapshot_ply >= 0:
+                    continue
+                case schemas.MoveEvent(ply=ply) if ply <= snapshot_ply:
+                    continue
+                case schemas.FenEvent(ply=ply) if ply <= snapshot_ply:
+                    continue
+            yield event
+            if isinstance(event, schemas.GameEndEvent):
+                return
+    except asyncio.CancelledError:
+        logger.info("SSE cancelled game=%s", game_id)
+        raise
+    finally:
+        game.unsubscribe(q)
+
+
+async def live_event_stream() -> AsyncIterator[LiveStreamEvent]:
+    """Event source for the all-games SSE endpoint."""
+    q = live_stream.subscribe()
+    try:
+        while True:
+            game_id, event = await q.get()
+            yield LiveStreamEvent(game_id=game_id, event=event)
+    finally:
+        live_stream.unsubscribe(q)

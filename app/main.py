@@ -9,7 +9,6 @@ from fastapi.routing import APIRoute
 from starlette.middleware.sessions import SessionMiddleware
 
 from app import db, streaming
-from app.auth import router as auth_router
 from app.config import settings
 from app.exceptions import AppException
 from app.routes import router
@@ -80,4 +79,3 @@ async def app_error_handler(request: Request, exc: AppException) -> JSONResponse
 
 
 app.include_router(router)
-app.include_router(auth_router)

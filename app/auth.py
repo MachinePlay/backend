@@ -1,6 +1,8 @@
-"""GitHub OAuth login via signed-cookie sessions.
+"""GitHub OAuth via signed-cookie sessions, API tokens, and current-user deps.
 
-Flow:
+This module owns auth *logic*; the HTTP endpoints that drive it live in
+:mod:`app.routes`. Login flow:
+
   1. Browser hits ``GET /auth/github/login`` → 302 to GitHub's consent screen
      (carrying a random ``state`` we stash in the session).
   2. GitHub redirects back to ``GET /auth/github/callback`` with ``code`` +
@@ -17,7 +19,8 @@ The handle (``User.login``) is chosen once at registration — it is the user's
 registry namespace and profile URL, and is never overwritten from GitHub.
 
 The session itself lives in a signed cookie managed by Starlette's
-``SessionMiddleware`` (wired up in ``app.main``).
+``SessionMiddleware`` (wired up in ``app.main``); session state is passed in
+here as the plain mutable mapping Starlette exposes.
 """
 
 import base64
@@ -26,28 +29,21 @@ import hashlib
 import logging
 import re
 import secrets
+from collections.abc import MutableMapping
+from typing import Any
 from urllib.parse import urlencode
 from uuid import UUID
 
 import httpx
-from fastapi import APIRouter, Depends, Request
-from fastapi.responses import RedirectResponse
+from fastapi import Depends, Request
 
-from app import registry
+from app import users
 from app.config import settings
 from app.exceptions import AppException, AuthError, ConflictError, NotFoundError
 from app.models import ApiToken, User, utcnow
-from app.schemas import (
-    ApiTokenOut,
-    PendingSignupOut,
-    RegisterRequest,
-    RegistryTokenOut,
-    TokenOut,
-    UserOut,
-)
+from app.schemas import PendingSignupOut
 
 logger = logging.getLogger(__name__)
-router = APIRouter()
 
 GITHUB_AUTHORIZE_URL = "https://github.com/login/oauth/authorize"
 GITHUB_TOKEN_URL = "https://github.com/login/oauth/access_token"
@@ -87,16 +83,40 @@ RESERVED_HANDLES = {
     "www",
 }
 
+Session = MutableMapping[str, Any]
 
-async def _handle_taken(login: str) -> User | None:
-    """Case-insensitive lookup so e.g. 'saegl' can't shadow 'Saegl'."""
-    return await User.find_one(
-        {"login": {"$regex": f"^{re.escape(login)}$", "$options": "i"}}
-    )
+
+# --- API tokens -------------------------------------------------------------
 
 
 def _hash_token(plaintext: str) -> str:
     return hashlib.sha256(plaintext.encode()).hexdigest()
+
+
+async def mint_token(user: User) -> str:
+    """Create a new API token for ``user`` and return its plaintext (once)."""
+    plaintext = "mp_" + secrets.token_urlsafe(32)
+    await ApiToken(
+        user_id=user.id,
+        token_hash=_hash_token(plaintext),
+        prefix=plaintext[:11],
+    ).insert()
+    logger.info("minted api token for user=%s", user.login)
+    return plaintext
+
+
+async def list_tokens(user: User) -> list[ApiToken]:
+    return (
+        await ApiToken.find(ApiToken.user_id == user.id).sort("-created_at").to_list()
+    )
+
+
+async def revoke_token(user: User, token_id: UUID) -> None:
+    token = await ApiToken.get(token_id)
+    if token is None or token.user_id != user.id:
+        raise NotFoundError("token not found")
+    await token.delete()
+    logger.info("revoked api token %s for user=%s", token.prefix, user.login)
 
 
 async def user_from_token(plaintext: str) -> User | None:
@@ -109,6 +129,9 @@ async def user_from_token(plaintext: str) -> User | None:
     token.last_used_at = utcnow()
     await token.save()
     return await User.get(token.user_id)
+
+
+# --- current-user resolution (FastAPI dependencies) -------------------------
 
 
 async def _user_from_bearer(request: Request) -> User | None:
@@ -135,17 +158,6 @@ async def require_user(user: User | None = Depends(get_current_user)) -> User:
     return user
 
 
-async def mint_token(user: User) -> str:
-    """Create a new API token for ``user`` and return its plaintext (once)."""
-    plaintext = "mp_" + secrets.token_urlsafe(32)
-    await ApiToken(
-        user_id=user.id,
-        token_hash=_hash_token(plaintext),
-        prefix=plaintext[:11],
-    ).insert()
-    return plaintext
-
-
 async def require_token_user(request: Request) -> User:
     """Resolve the user from an ``Authorization: Bearer <token>`` header.
 
@@ -158,13 +170,47 @@ async def require_token_user(request: Request) -> User:
     return user
 
 
-@router.get("/auth/github/login")
-async def github_login(request: Request) -> RedirectResponse:
+async def user_from_basic(request: Request) -> User | None:
+    """Resolve a user from the ``mp_`` token sent as an HTTP Basic password.
+
+    Used by the docker-registry token endpoint (``docker login`` sends the
+    token as the Basic password). Returns None when no Basic credentials were
+    sent (anonymous pulls); 401s when credentials were sent but don't resolve.
+    """
+    password = _basic_password(request)
+    if password is None:
+        return None
+    user = await user_from_token(password)
+    if user is None:
+        # docker login surfaces this as an auth failure.
+        raise AuthError("invalid registry credentials")
+    return user
+
+
+def _basic_password(request: Request) -> str | None:
+    """Return the password from an ``Authorization: Basic`` header, or None."""
+    header = request.headers.get("Authorization", "")
+    scheme, _, encoded = header.partition(" ")
+    if scheme.lower() != "basic" or not encoded:
+        return None
+    try:
+        decoded = base64.b64decode(encoded).decode("utf-8")
+    except (binascii.Error, UnicodeDecodeError):
+        return None
+    _, _, password = decoded.partition(":")
+    return password or None
+
+
+# --- GitHub OAuth flow -------------------------------------------------------
+
+
+def begin_github_login(session: Session) -> str:
+    """Stash a CSRF ``state`` in the session, return GitHub's consent URL."""
     if not settings.github_client_id:
         raise AppException("GitHub OAuth is not configured (set GITHUB_CLIENT_ID)")
 
     state = secrets.token_urlsafe(32)
-    request.session["oauth_state"] = state
+    session["oauth_state"] = state
     query = urlencode(
         {
             "client_id": settings.github_client_id,
@@ -174,15 +220,11 @@ async def github_login(request: Request) -> RedirectResponse:
             "allow_signup": "true",
         }
     )
-    return RedirectResponse(f"{GITHUB_AUTHORIZE_URL}?{query}")
+    return f"{GITHUB_AUTHORIZE_URL}?{query}"
 
 
-@router.get("/auth/github/callback")
-async def github_callback(request: Request, code: str, state: str) -> RedirectResponse:
-    expected = request.session.pop("oauth_state", None)
-    if not expected or not secrets.compare_digest(state, expected):
-        raise AuthError("invalid oauth state")
-
+async def _fetch_github_profile(code: str) -> dict[str, Any]:
+    """Exchange the OAuth ``code`` for an access token and fetch the profile."""
     async with httpx.AsyncClient(timeout=10.0) as client:
         token_resp = await client.post(
             GITHUB_TOKEN_URL,
@@ -207,19 +249,28 @@ async def github_callback(request: Request, code: str, state: str) -> RedirectRe
             },
         )
         user_resp.raise_for_status()
-        gh = user_resp.json()
+        profile: dict[str, Any] = user_resp.json()
+        return profile
 
+
+async def complete_github_login(session: Session, code: str, state: str) -> str:
+    """Handle the OAuth callback; returns the frontend URL to redirect to."""
+    expected = session.pop("oauth_state", None)
+    if not expected or not secrets.compare_digest(state, expected):
+        raise AuthError("invalid oauth state")
+
+    gh = await _fetch_github_profile(code)
     user = await User.find_one(User.github_id == gh["id"])
     if user is None:
         # Unknown GitHub account: stash the profile and let the user pick a
         # handle on the frontend's /register page before creating anything.
-        request.session["pending_signup"] = {
+        session["pending_signup"] = {
             "github_id": gh["id"],
             "login": gh["login"],
             "name": gh.get("name"),
             "avatar_url": gh.get("avatar_url", ""),
         }
-        return RedirectResponse(f"{settings.frontend_url}/register")
+        return f"{settings.frontend_url}/register"
 
     # Refresh profile fields that may have changed on GitHub. The handle
     # (login) is chosen at registration and never overwritten.
@@ -227,14 +278,13 @@ async def github_callback(request: Request, code: str, state: str) -> RedirectRe
     user.avatar_url = gh.get("avatar_url", "")
     await user.save()
 
-    request.session["user_id"] = str(user.id)
-    return RedirectResponse(settings.frontend_url)
+    session["user_id"] = str(user.id)
+    return settings.frontend_url
 
 
-@router.get("/auth/pending", response_model=PendingSignupOut)
-async def pending_signup(request: Request) -> PendingSignupOut:
+def pending_signup(session: Session) -> PendingSignupOut:
     """The GitHub profile waiting on a handle, for the /register page."""
-    pending = request.session.get("pending_signup")
+    pending = session.get("pending_signup")
     if not pending:
         raise AuthError("no signup in progress")
     return PendingSignupOut(
@@ -244,10 +294,9 @@ async def pending_signup(request: Request) -> PendingSignupOut:
     )
 
 
-@router.post("/auth/register", response_model=UserOut)
-async def register(request: Request, payload: RegisterRequest) -> User:
-    """Complete a pending GitHub signup with the chosen handle."""
-    pending = request.session.get("pending_signup")
+async def register(session: Session, requested_login: str) -> User:
+    """Complete a pending GitHub signup with the chosen handle and log it in."""
+    pending = session.get("pending_signup")
     if not pending:
         raise AuthError("no signup in progress")
 
@@ -255,7 +304,7 @@ async def register(request: Request, payload: RegisterRequest) -> User:
     # this signup was pending; if so just log it in.
     user = await User.find_one(User.github_id == pending["github_id"])
     if user is None:
-        login = payload.login.strip().lower()
+        login = requested_login.strip().lower()
         if not HANDLE_RE.fullmatch(login):
             raise ConflictError(
                 "handle must be 1-32 characters: a-z, 0-9 and single hyphens, "
@@ -263,7 +312,7 @@ async def register(request: Request, payload: RegisterRequest) -> User:
             )
         if login in RESERVED_HANDLES:
             raise ConflictError(f"handle {login!r} is reserved")
-        if await _handle_taken(login) is not None:
+        if await users.find_by_login(login) is not None:
             raise ConflictError(f"handle {login!r} is already taken")
         user = User(
             github_id=pending["github_id"],
@@ -274,108 +323,6 @@ async def register(request: Request, payload: RegisterRequest) -> User:
         await user.insert()
         logger.info("registered new user login=%s id=%s", user.login, user.id)
 
-    request.session.pop("pending_signup", None)
-    request.session["user_id"] = str(user.id)
+    session.pop("pending_signup", None)
+    session["user_id"] = str(user.id)
     return user
-
-
-@router.get("/me", response_model=UserOut)
-async def me(user: User = Depends(require_user)) -> User:
-    return user
-
-
-@router.post("/me/tokens", response_model=TokenOut)
-async def create_token(user: User = Depends(require_user)) -> TokenOut:
-    """Mint a CLI API token for the logged-in user (shown once)."""
-    plaintext = await mint_token(user)
-    logger.info("minted api token for user=%s", user.login)
-    return TokenOut(token=plaintext)
-
-
-@router.get("/me/tokens", response_model=list[ApiTokenOut])
-async def list_tokens(user: User = Depends(require_user)) -> list[ApiToken]:
-    """The logged-in user's API tokens (prefix + timestamps, never plaintext)."""
-    return (
-        await ApiToken.find(ApiToken.user_id == user.id).sort("-created_at").to_list()
-    )
-
-
-@router.delete("/me/tokens/{token_id}")
-async def revoke_token(
-    token_id: UUID, user: User = Depends(require_user)
-) -> dict[str, bool]:
-    token = await ApiToken.get(token_id)
-    if token is None or token.user_id != user.id:
-        raise NotFoundError("token not found")
-    await token.delete()
-    logger.info("revoked api token %s for user=%s", token.prefix, user.login)
-    return {"success": True}
-
-
-@router.post("/auth/logout")
-async def logout(request: Request) -> dict[str, bool]:
-    request.session.clear()
-    return {"success": True}
-
-
-def _basic_password(request: Request) -> str | None:
-    """Return the password from an ``Authorization: Basic`` header, or None."""
-    header = request.headers.get("Authorization", "")
-    scheme, _, encoded = header.partition(" ")
-    if scheme.lower() != "basic" or not encoded:
-        return None
-    try:
-        decoded = base64.b64decode(encoded).decode("utf-8")
-    except (binascii.Error, UnicodeDecodeError):
-        return None
-    _, _, password = decoded.partition(":")
-    return password or None
-
-
-@router.get("/registry/token", response_model=RegistryTokenOut)
-async def registry_token(request: Request) -> RegistryTokenOut:
-    """Docker Registry v2 token endpoint (the registry's `auth.token.realm`).
-
-    Authenticates the ``mp_`` token sent as the HTTP Basic password (written by
-    ``machineplay login``) and mints a signed JWT granting the requested scopes:
-    ``pull`` is always allowed (engines are public); ``push`` only when the
-    repository is namespaced under the authenticated user's login.
-    """
-    password = _basic_password(request)
-    user: User | None = None
-    if password is not None:
-        user = await user_from_token(password)
-        if user is None:
-            # docker login surfaces this as an auth failure.
-            raise AuthError("invalid registry credentials")
-
-    namespace = user.login.lower() if user else None
-    granted: list[registry.Access] = []
-    for scope in request.query_params.getlist("scope"):
-        access = registry.parse_scope(scope)
-        if access is None:
-            continue
-        repo_ns = access.name.split("/", 1)[0]
-        actions: list[str] = []
-        if "pull" in access.actions or "*" in access.actions:
-            actions.append("pull")
-        if (
-            ("push" in access.actions or "*" in access.actions)
-            and namespace is not None
-            and repo_ns == namespace
-        ):
-            actions.append("push")
-        if actions:
-            granted.append(
-                registry.Access(type=access.type, name=access.name, actions=actions)
-            )
-
-    token, ttl = registry.make_token(
-        subject=user.login if user else "", granted=granted
-    )
-    return RegistryTokenOut(
-        token=token,
-        access_token=token,
-        expires_in=ttl,
-        issued_at=utcnow().isoformat(),
-    )

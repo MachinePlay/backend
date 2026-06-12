@@ -34,6 +34,8 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.rsa import RSAPrivateKey
 
 from app.config import settings
+from app.models import User, utcnow
+from app.schemas import RegistryTokenOut
 
 
 @dataclass(frozen=True)
@@ -111,6 +113,48 @@ def parse_scope(scope: str) -> Access | None:
     if not name or not actions:
         return None
     return Access(type="repository", name=name, actions=actions)
+
+
+def grant_scopes(scopes: list[str], namespace: str | None) -> list[Access]:
+    """Decide which of the requested scope actions to grant.
+
+    ``pull`` is always allowed (engines are public); ``push`` only when the
+    repository is namespaced under ``namespace`` (the authenticated user's
+    login). Malformed or unsupported scopes are skipped.
+    """
+    granted: list[Access] = []
+    for scope in scopes:
+        access = parse_scope(scope)
+        if access is None:
+            continue
+        repo_ns = access.name.split("/", 1)[0]
+        actions: list[str] = []
+        if "pull" in access.actions or "*" in access.actions:
+            actions.append("pull")
+        if (
+            ("push" in access.actions or "*" in access.actions)
+            and namespace is not None
+            and repo_ns == namespace
+        ):
+            actions.append("push")
+        if actions:
+            granted.append(Access(type=access.type, name=access.name, actions=actions))
+    return granted
+
+
+def issue_token(user: User | None, scopes: list[str]) -> RegistryTokenOut:
+    """Mint a registry token response for `user` (None = anonymous pull-only)."""
+    namespace = user.login.lower() if user else None
+    token, ttl = make_token(
+        subject=user.login if user else "",
+        granted=grant_scopes(scopes, namespace),
+    )
+    return RegistryTokenOut(
+        token=token,
+        access_token=token,
+        expires_in=ttl,
+        issued_at=utcnow().isoformat(),
+    )
 
 
 def make_token(subject: str, granted: list[Access]) -> tuple[str, int]:

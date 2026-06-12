@@ -1,233 +1,143 @@
-import asyncio
-import logging
-import re
+"""The API surface: one thin router.
+
+Handlers only translate HTTP (params, session, redirects) to and from the
+domain modules — auth, engines, games, users, registry, streaming. Logic
+lives there, not here.
+"""
+
 from collections.abc import AsyncIterable
 from uuid import UUID
 
-from fastapi import (
-    APIRouter,
-    Depends,
-    WebSocket,
-    WebSocketDisconnect,
-)
+from fastapi import APIRouter, Depends, Query, Request, WebSocket
+from fastapi.responses import RedirectResponse
 from fastapi.sse import EventSourceResponse
 
 from machineplay import schemas
 
-from app import streaming
-from app.auth import require_token_user, require_user
-from app.config import settings
-from app.exceptions import (
-    ConflictError,
-    NotFoundError,
-    RunnerBusyError,
-)
-from app.models import Engine, EngineVersion, Game, User
+from app import auth, engines, games, registry, streaming, users
+from app.models import ApiToken, Game, User
 from app.schemas import (
+    ApiTokenOut,
     EngineDetailOut,
     EngineOut,
     EngineRegisterRequest,
     EngineRegisterResponse,
-    EngineVersionOut,
     GameOut,
     LiveStreamEvent,
+    PendingSignupOut,
+    RegisterRequest,
+    RegistryTokenOut,
     RunnerOut,
     StartGameRequest,
     StartGameResponse,
+    TokenOut,
+    UserOut,
     UserProfileOut,
 )
 
-logger = logging.getLogger(__name__)
 router = APIRouter()
 
-# Engine names live in URLs (machineplay.org/{login}/{engine}) and docker
-# repository paths, so they are lowercase slugs: a-z/0-9 with single interior
-# separators (. _ -), max 64 chars.
-ENGINE_NAME_RE = re.compile(r"^[a-z0-9](?:[._-]?[a-z0-9]){0,63}$")
+
+# --- auth & account ----------------------------------------------------------
 
 
-async def _engine_to_out(engine: Engine) -> EngineOut:
-    count = await EngineVersion.find(EngineVersion.engine_id == engine.id).count()
-    return EngineOut(
-        id=engine.id,
-        name=engine.name,
-        description=engine.description,
-        owner_login=engine.owner_login,
-        version_count=count,
+@router.get("/auth/github/login")
+async def github_login(request: Request) -> RedirectResponse:
+    return RedirectResponse(auth.begin_github_login(request.session))
+
+
+@router.get("/auth/github/callback")
+async def github_callback(request: Request, code: str, state: str) -> RedirectResponse:
+    return RedirectResponse(
+        await auth.complete_github_login(request.session, code, state)
     )
 
 
-async def _latest_version(engine_id: UUID) -> EngineVersion | None:
-    """The most recently uploaded image version for an engine, or None."""
-    return (
-        await EngineVersion.find(EngineVersion.engine_id == engine_id)
-        .sort("-created_at")
-        .first_or_none()
-    )
+@router.get("/auth/pending", response_model=PendingSignupOut)
+async def pending_signup(request: Request) -> PendingSignupOut:
+    """The GitHub profile waiting on a handle, for the /register page."""
+    return auth.pending_signup(request.session)
 
 
-async def _resolve_version(engine: Engine, version_id: UUID | None) -> EngineVersion:
-    """The requested uploaded version of `engine`, or its latest when None."""
-    if version_id is None:
-        version = await _latest_version(engine.id)
-        if version is None:
-            raise NotFoundError(f"engine {engine.name!r} has no uploaded image to play")
-        return version
-    version = await EngineVersion.get(version_id)
-    if version is None or version.engine_id != engine.id:
-        raise NotFoundError(f"engine {engine.name!r} has no such version")
-    return version
+@router.post("/auth/register", response_model=UserOut)
+async def register(request: Request, payload: RegisterRequest) -> User:
+    """Complete a pending GitHub signup with the chosen handle."""
+    return await auth.register(request.session, payload.login)
+
+
+@router.post("/auth/logout")
+async def logout(request: Request) -> dict[str, bool]:
+    request.session.clear()
+    return {"success": True}
+
+
+@router.get("/me", response_model=UserOut)
+async def me(user: User = Depends(auth.require_user)) -> User:
+    return user
+
+
+@router.post("/me/tokens", response_model=TokenOut)
+async def create_token(user: User = Depends(auth.require_user)) -> TokenOut:
+    """Mint a CLI API token for the logged-in user (shown once)."""
+    return TokenOut(token=await auth.mint_token(user))
+
+
+@router.get("/me/tokens", response_model=list[ApiTokenOut])
+async def list_tokens(user: User = Depends(auth.require_user)) -> list[ApiToken]:
+    """The logged-in user's API tokens (prefix + timestamps, never plaintext)."""
+    return await auth.list_tokens(user)
+
+
+@router.delete("/me/tokens/{token_id}")
+async def revoke_token(
+    token_id: UUID, user: User = Depends(auth.require_user)
+) -> dict[str, bool]:
+    await auth.revoke_token(user, token_id)
+    return {"success": True}
+
+
+@router.get("/registry/token", response_model=RegistryTokenOut)
+async def registry_token(request: Request) -> RegistryTokenOut:
+    """Docker Registry v2 token endpoint (the registry's `auth.token.realm`).
+
+    Authenticates the ``mp_`` token sent as the HTTP Basic password (written by
+    ``machineplay login``) and mints a signed JWT granting the requested scopes.
+    """
+    user = await auth.user_from_basic(request)
+    return registry.issue_token(user, request.query_params.getlist("scope"))
+
+
+# --- engines & profiles -------------------------------------------------------
 
 
 @router.get("/engine", response_model=list[EngineOut])
 async def list_engines() -> list[EngineOut]:
-    engines = await Engine.find_all().to_list()
-    return [await _engine_to_out(e) for e in engines]
-
-
-async def _recent_games(engine_ids: list[UUID], limit: int = 20) -> list[Game]:
-    if not engine_ids:
-        return []
-    return (
-        await Game.find(
-            {
-                "$or": [
-                    {"white_id": {"$in": engine_ids}},
-                    {"black_id": {"$in": engine_ids}},
-                ]
-            }
-        )
-        .sort("-created_at")
-        .limit(limit)
-        .to_list()
-    )
-
-
-async def _engine_detail(engine: Engine) -> EngineDetailOut:
-    versions = (
-        await EngineVersion.find(EngineVersion.engine_id == engine.id)
-        .sort("-created_at")
-        .to_list()
-    )
-    games = await _recent_games([engine.id])
-    return EngineDetailOut(
-        id=engine.id,
-        name=engine.name,
-        description=engine.description,
-        owner_login=engine.owner_login,
-        created_at=engine.created_at,
-        versions=[EngineVersionOut.model_validate(v) for v in versions],
-        games=[GameOut.model_validate(g) for g in games],
-    )
+    return await engines.list_engines()
 
 
 @router.post("/engine/register", response_model=EngineRegisterResponse)
 async def register_engine(
     payload: EngineRegisterRequest,
-    user: User = Depends(require_token_user),
+    user: User = Depends(auth.require_token_user),
 ) -> EngineRegisterResponse:
-    """Record an engine version after the CLI pushed its image to the registry.
-
-    The push itself was authorized per-scope by the registry token endpoint;
-    this just find-or-creates the Engine and stores the image coordinates
-    (repository + digest) as an EngineVersion. Loading/running the image during
-    games is the M6 follow-up.
-    """
-    name = payload.name.strip().lower()
-    version = payload.version.strip()
-    repository = payload.repository.strip().lower()
-    digest = payload.digest.strip()
-    if not (name and version and repository and digest):
-        raise ConflictError("name, version, repository and digest are required")
-    if not ENGINE_NAME_RE.fullmatch(name):
-        raise ConflictError(
-            "engine name must be 1-64 characters: a-z, 0-9 and single "
-            "interior separators (. _ -)"
-        )
-
-    # Defense in depth: the token issuer only grants push under the user's own
-    # namespace, but re-check here so a leaked token can't register an image
-    # under someone else's name.
-    namespace = user.login.lower()
-    if repository.split("/", 1)[0] != namespace:
-        raise ConflictError(f"repository must be namespaced under {namespace!r}")
-
-    engine = await Engine.find_one(Engine.owner_id == user.id, Engine.name == name)
-    if engine is None:
-        engine = Engine(name=name, owner_id=user.id, owner_login=user.login)
-        await engine.insert()
-        logger.info("created engine %s/%s id=%s", user.login, name, engine.id)
-
-    existing = await EngineVersion.find_one(
-        EngineVersion.engine_id == engine.id, EngineVersion.version == version
-    )
-    if existing is not None:
-        raise ConflictError(
-            f"version {version!r} already exists for {user.login}/{name}"
-        )
-
-    doc = EngineVersion(
-        engine_id=engine.id,
-        version=version,
-        image_repository=repository,
-        image_digest=digest,
-        size_bytes=payload.size_bytes,
-    )
-    await doc.insert()
-    logger.info(
-        "registered %s/%s version=%s image=%s@%s",
-        user.login,
-        name,
-        version,
-        repository,
-        digest,
-    )
-
-    return EngineRegisterResponse(
-        engine_id=engine.id,
-        name=name,
-        owner_login=user.login,
-        version=version,
-        url=f"{settings.frontend_url}/{user.login}/{engine.name}",
-    )
-
-
-async def _user_by_login(login: str) -> User:
-    user = await User.find_one(
-        {"login": {"$regex": f"^{re.escape(login)}$", "$options": "i"}}
-    )
-    if user is None:
-        raise NotFoundError("user not found")
-    return user
+    """Record an engine version after the CLI pushed its image to the registry."""
+    return await engines.register_version(user, payload)
 
 
 @router.get("/u/{login}", response_model=UserProfileOut)
 async def user_profile(login: str) -> UserProfileOut:
     """Public profile: the user, their engines, and those engines' games."""
-    user = await _user_by_login(login)
-    engines = await Engine.find(Engine.owner_id == user.id).to_list()
-    games = await _recent_games([e.id for e in engines])
-    return UserProfileOut(
-        login=user.login,
-        name=user.name,
-        avatar_url=user.avatar_url,
-        created_at=user.created_at,
-        engines=[await _engine_to_out(e) for e in engines],
-        games=[GameOut.model_validate(g) for g in games],
-    )
+    return await users.profile(login)
 
 
 @router.get("/u/{login}/{engine_name}", response_model=EngineDetailOut)
 async def get_engine_by_name(login: str, engine_name: str) -> EngineDetailOut:
     """Engine detail addressed GitHub-style: owner handle + engine name."""
-    user = await _user_by_login(login)
-    engine = await Engine.find_one(
-        Engine.owner_id == user.id,
-        {"name": {"$regex": f"^{re.escape(engine_name)}$", "$options": "i"}},
-    )
-    if engine is None:
-        raise NotFoundError("engine not found")
-    return await _engine_detail(engine)
+    owner = await users.by_login(login)
+    return await engines.detail(await engines.by_name(owner, engine_name))
+
+
+# --- games & runners ----------------------------------------------------------
 
 
 @router.get("/runners", response_model=list[RunnerOut])
@@ -237,136 +147,27 @@ async def list_runners() -> list[streaming.Runner]:
 
 @router.post("/game")
 async def start_game(
-    payload: StartGameRequest, user: User = Depends(require_user)
+    payload: StartGameRequest, user: User = Depends(auth.require_user)
 ) -> StartGameResponse:
-    logger.info("start_game requested by user=%s", user.login)
-    white = await Engine.get(payload.white_engine_id)
-    black = await Engine.get(payload.black_engine_id)
-    if white is None or black is None:
-        raise NotFoundError("engine not found")
-
-    white_version = await _resolve_version(white, payload.white_version_id)
-    black_version = await _resolve_version(black, payload.black_version_id)
-
-    runner = streaming.runners.get_runner(payload.runner_id)
-
-    if runner.is_full():
-        raise RunnerBusyError(
-            details={
-                "runner_id": str(runner.runner_id),
-                "active_games": runner.active_games,
-                "max_games": runner.max_games,
-            }
-        )
-
-    doc = Game(
-        white_id=white.id,
-        black_id=black.id,
-        white_name=white.name,
-        black_name=black.name,
-        white_version=white_version.version,
-        black_version=black_version.version,
-    )
-    await doc.insert()
-
-    streaming.game_registry.register_game(doc.id)
-    runner.track_game(doc.id)
-
-    await runner.scheduled_commands.put(
-        schemas.StartGame(
-            game_id=doc.id,
-            white=schemas.EngineConfig(
-                name=white.name,
-                repository=white_version.image_repository,
-                digest=white_version.image_digest,
-            ),
-            black=schemas.EngineConfig(
-                name=black.name,
-                repository=black_version.image_repository,
-                digest=black_version.image_digest,
-            ),
-            tc=settings.tc,
-        )
-    )
-    logger.info("scheduled game=%s on runner=%s", doc.id, runner.runner_id)
-
-    return StartGameResponse(
-        id=doc.id,
-        status="started",
-        white=white.id,
-        black=black.id,
-    )
+    return await games.start_game(user, payload)
 
 
 @router.get("/game", response_model=list[GameOut])
-async def list_games(limit: int = 50) -> list[Game]:
-    limit = max(1, min(limit, 200))
-    return await Game.find_all().sort("-created_at").limit(limit).to_list()
+async def list_games(limit: int = Query(default=50, ge=1, le=200)) -> list[Game]:
+    return await games.list_games(limit)
 
 
 @router.get("/game/{game_id}", response_model=GameOut)
 async def get_game(game_id: UUID) -> Game:
-    doc = await Game.get(game_id)
-    if doc is None:
-        raise NotFoundError("game not found")
-    return doc
+    return await games.get_game(game_id)
+
+
+# --- live streaming -----------------------------------------------------------
 
 
 @router.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket) -> None:
-    await ws.accept()
-
-    intro = schemas.Introduction.model_validate_json(await ws.receive_text())
-    runner = streaming.runners.register_runner(
-        intro.runner_id, intro.name, max_games=intro.max_games
-    )
-    logger.info(
-        "runner connected id=%s name=%s max_games=%d",
-        intro.runner_id,
-        intro.name,
-        intro.max_games,
-    )
-
-    async def receiver() -> None:
-        while True:
-            data = await ws.receive_text()
-            cmd: schemas.ClientCommandType = schemas.client_adapter.validate_json(data)
-            match cmd:
-                case schemas.GameEvent(game_id=game_id, event=event):
-                    try:
-                        game = streaming.game_registry.get_game(game_id)
-                    except NotFoundError:
-                        logger.warning("event for unregistered game_id=%s", game_id)
-                        continue
-                    if isinstance(event, schemas.GameEndEvent):
-                        runner.untrack_game(game_id)
-                        streaming.game_registry.registry.pop(game_id, None)
-                    await streaming.persist_event(game_id, event)
-                    await game.broadcast(event)
-                    await streaming.live_stream.broadcast(game_id, event)
-
-    async def sender() -> None:
-        while True:
-            command = await runner.scheduled_commands.get()
-            await ws.send_text(command.model_dump_json())
-
-    recv_task = asyncio.create_task(receiver())
-    send_task = asyncio.create_task(sender())
-
-    try:
-        done, _ = await asyncio.wait(
-            {recv_task, send_task},
-            return_when=asyncio.FIRST_EXCEPTION,
-        )
-        for task in done:
-            task.result()  # re-raise exceptions
-    except WebSocketDisconnect:
-        logger.info("runner disconnected id=%s", intro.runner_id)
-    finally:
-        recv_task.cancel()
-        send_task.cancel()
-        await runner.abort_games()
-        streaming.runners.unregister_runner(intro.runner_id)
+    await streaming.runner_session(ws)
 
 
 @router.get(
@@ -378,57 +179,8 @@ async def websocket_endpoint(ws: WebSocket) -> None:
     responses={200: {"model": schemas.GameStreamEvent}},
 )
 async def sse_stream(game_id: UUID) -> AsyncIterable[schemas.GameStreamEvent]:
-    try:
-        game = streaming.game_registry.get_game(game_id)
-    except NotFoundError:
-        # Game is no longer live; if it exists in the DB, emit a single
-        # terminal event so late subscribers see a clean end rather than 404.
-        doc = await Game.get(game_id)
-        if doc is None:
-            raise
-        yield schemas.GameEndEvent(result=doc.result, pgn=doc.pgn)
-        return
-
-    q = game.subscribe()
-    try:
-        # Subscribe-then-snapshot: the WS receiver writes the DB before
-        # broadcasting, so anything already in the snapshot is also (or about
-        # to be) in our queue. Dedup queued events by ply against the snapshot
-        # so the client sees each event exactly once.
-        doc = await Game.get(game_id)
-        snapshot_ply = -1
-        if doc is not None:
-            snapshot_ply = len(doc.moves)
-            yield schemas.FenEvent(
-                fen=doc.fen,
-                ply=snapshot_ply,
-                white_name=doc.white_name,
-                black_name=doc.black_name,
-                moves=doc.moves,
-                white_clock=doc.white_clock,
-                black_clock=doc.black_clock,
-                result=doc.result,
-                status=doc.status,
-                game_id=game_id,
-            )
-
-        while True:
-            event = await q.get()
-            match event:
-                case schemas.GameStartEvent() if snapshot_ply >= 0:
-                    continue
-                case schemas.MoveEvent(ply=ply) if ply <= snapshot_ply:
-                    continue
-                case schemas.FenEvent(ply=ply) if ply <= snapshot_ply:
-                    continue
-            yield event
-            if isinstance(event, schemas.GameEndEvent):
-                return
-    except asyncio.CancelledError:
-        logger.info("SSE cancelled game=%s", game_id)
-        raise
-    finally:
-        game.unsubscribe(q)
+    async for event in streaming.game_event_stream(game_id):
+        yield event
 
 
 @router.get(
@@ -437,10 +189,5 @@ async def sse_stream(game_id: UUID) -> AsyncIterable[schemas.GameStreamEvent]:
     responses={200: {"model": LiveStreamEvent}},
 )
 async def sse_live_stream() -> AsyncIterable[LiveStreamEvent]:
-    q = streaming.live_stream.subscribe()
-    try:
-        while True:
-            game_id, event = await q.get()
-            yield LiveStreamEvent(game_id=game_id, event=event)
-    finally:
-        streaming.live_stream.unsubscribe(q)
+    async for event in streaming.live_event_stream():
+        yield event

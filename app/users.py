@@ -25,7 +25,7 @@ async def by_login(login: str) -> User:
 async def profile(login: str) -> UserProfileOut:
     """Public profile: the user, their engines, and those engines' games."""
     user = await by_login(login)
-    owned = await Engine.find(Engine.owner_id == user.id).to_list()
+    owned = await Engine.find({"owner.$id": user.id}).to_list()
     recent = await games.recent_games([e.id for e in owned])
     return UserProfileOut(
         login=user.login,

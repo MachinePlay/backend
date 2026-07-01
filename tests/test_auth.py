@@ -107,10 +107,10 @@ async def test_token_list_and_revoke() -> None:
 
 async def test_user_profile() -> None:
     user = await User(github_id=9, login="profiled").insert()
-    engine = await Engine(name="bot", owner_id=user.id, owner_login=user.login).insert()
+    engine = await Engine(name="bot", owner=user, owner_login=user.login).insert()
     await Game(
-        white_id=engine.id,
-        black_id=engine.id,
+        white=engine,
+        black=engine,
         white_name="bot",
         black_name="bot",
         white_version="v1",
@@ -130,12 +130,10 @@ async def test_user_profile() -> None:
 
 async def test_engine_by_name() -> None:
     user = await User(github_id=10, login="owner").insert()
-    engine = await Engine(
-        name="my-bot", owner_id=user.id, owner_login=user.login
-    ).insert()
+    engine = await Engine(name="my-bot", owner=user, owner_login=user.login).insert()
     await Game(
-        white_id=engine.id,
-        black_id=engine.id,
+        white=engine,
+        black=engine,
         white_name="my-bot",
         black_name="my-bot",
         white_version="v1",

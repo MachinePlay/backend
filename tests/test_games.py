@@ -7,26 +7,24 @@ from app.main import app
 from app.models import Engine, EngineVersion, User
 
 
-async def _setup() -> tuple[dict[str, str], Engine, EngineVersion]:
+async def _setup() -> tuple[dict[str, str], User, Engine, EngineVersion]:
     user = await User(github_id=20, login="player").insert()
     token = await mint_token(user)
-    engine = await Engine(name="bot", owner_id=user.id, owner_login=user.login).insert()
+    engine = await Engine(name="bot", owner=user, owner_login=user.login).insert()
     version = await EngineVersion(
-        engine_id=engine.id,
+        engine=engine,
         version="v1",
         image_repository="player/bot",
         image_digest="sha256:abc",
     ).insert()
-    return {"Authorization": f"Bearer {token}"}, engine, version
+    return {"Authorization": f"Bearer {token}"}, user, engine, version
 
 
 async def test_start_game_rejects_foreign_version() -> None:
-    headers, engine, _ = await _setup()
-    other = await Engine(
-        name="other", owner_id=engine.owner_id, owner_login="player"
-    ).insert()
+    headers, user, engine, _ = await _setup()
+    other = await Engine(name="other", owner=user, owner_login="player").insert()
     other_version = await EngineVersion(
-        engine_id=other.id,
+        engine=other,
         version="v1",
         image_repository="player/other",
         image_digest="sha256:def",
@@ -51,7 +49,7 @@ async def test_start_game_rejects_foreign_version() -> None:
 
 
 async def test_start_game_resolves_versions_before_runner() -> None:
-    headers, engine, version = await _setup()
+    headers, _, engine, version = await _setup()
 
     async with AsyncClient(
         transport=ASGITransport(app=app), base_url="http://test"

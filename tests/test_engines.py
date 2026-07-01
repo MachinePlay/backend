@@ -1,9 +1,7 @@
-from uuid import uuid4
-
 from httpx import ASGITransport, AsyncClient
 
 from app.main import app
-from app.models import Engine
+from app.models import Engine, User
 
 
 async def test_list_engines_empty() -> None:
@@ -15,11 +13,11 @@ async def test_list_engines_empty() -> None:
 
 
 async def test_list_engines_returns_inserted() -> None:
-    owner = uuid4()
+    owner = await User(github_id=100, login="alice").insert()
     await Engine(
-        name="stockfish", description="sf", owner_id=owner, owner_login="alice"
+        name="stockfish", description="sf", owner=owner, owner_login="alice"
     ).insert()
-    await Engine(name="lc0", owner_id=owner, owner_login="alice").insert()
+    await Engine(name="lc0", owner=owner, owner_login="alice").insert()
 
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:

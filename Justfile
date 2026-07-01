@@ -33,3 +33,12 @@ deploy:
 # Follow backend logs from the VPS.
 logs:
     ssh -t root@machineplay.org 'journalctl -u machineplay -n 200 -f'
+
+# Back up the prod DB with mongodump into /root/mp-backup-<timestamp> on the VPS.
+backup:
+    ssh root@machineplay.org 'set -a; . /etc/machineplay/backend.env; set +a; mongodump --uri="$MONGO_URL/$MONGO_DB" --out "/root/mp-backup-$(date +%F-%H%M%S)"'
+
+# Run a prod data migration by number, e.g. `just migrate 001`. Back up first
+# (`just backup`) and run it between the code pull and the service restart.
+migrate num:
+    ssh root@machineplay.org 'cd /root/backend; set -a; . /etc/machineplay/backend.env; set +a; PYTHONPATH=. uv run python migrations/{{num}}_*.py'

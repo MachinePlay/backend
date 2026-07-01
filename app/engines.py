@@ -2,10 +2,7 @@
 
 import logging
 import re
-from collections import Counter
 from uuid import UUID
-
-from pydantic import BaseModel
 
 from app.config import settings
 from app.exceptions import ConflictError, NotFoundError
@@ -28,20 +25,17 @@ logger = logging.getLogger(__name__)
 ENGINE_NAME_RE = re.compile(r"^[a-z0-9](?:[._-]?[a-z0-9]){0,63}$")
 
 
-class _EngineIdOnly(BaseModel):
-    engine_id: UUID
-
-
 async def _version_counts(engine_ids: list[UUID]) -> dict[UUID, int]:
     """Uploaded-version count per engine, in a single query."""
     if not engine_ids:
         return {}
-    rows = (
-        await EngineVersion.find({"engine_id": {"$in": engine_ids}})
-        .project(_EngineIdOnly)
-        .to_list()
-    )
-    return Counter(row.engine_id for row in rows)
+    rows = await EngineVersion.aggregate(
+        [
+            {"$match": {"engine.$id": {"$in": engine_ids}}},
+            {"$group": {"_id": "$engine.$id", "count": {"$sum": 1}}},
+        ]
+    ).to_list()
+    return {row["_id"]: row["count"] for row in rows}
 
 
 async def to_out(engines: list[Engine]) -> list[EngineOut]:
@@ -65,7 +59,7 @@ async def list_engines() -> list[EngineOut]:
 async def by_name(owner: User, name: str) -> Engine:
     """Case-insensitive engine lookup within an owner's namespace."""
     engine = await Engine.find_one(
-        Engine.owner_id == owner.id,
+        {"owner.$id": owner.id},
         {"name": {"$regex": f"^{re.escape(name)}$", "$options": "i"}},
     )
     if engine is None:
@@ -75,7 +69,7 @@ async def by_name(owner: User, name: str) -> Engine:
 
 async def detail(engine: Engine) -> EngineDetailOut:
     versions = (
-        await EngineVersion.find(EngineVersion.engine_id == engine.id)
+        await EngineVersion.find({"engine.$id": engine.id})
         .sort("-created_at")
         .to_list()
     )
@@ -119,14 +113,14 @@ async def register_version(
     if repository.split("/", 1)[0] != namespace:
         raise ConflictError(f"repository must be namespaced under {namespace!r}")
 
-    engine = await Engine.find_one(Engine.owner_id == user.id, Engine.name == name)
+    engine = await Engine.find_one({"owner.$id": user.id}, Engine.name == name)
     if engine is None:
-        engine = Engine(name=name, owner_id=user.id, owner_login=user.login)
+        engine = Engine(name=name, owner=user, owner_login=user.login)
         await engine.insert()
         logger.info("created engine %s/%s id=%s", user.login, name, engine.id)
 
     existing = await EngineVersion.find_one(
-        EngineVersion.engine_id == engine.id, EngineVersion.version == version
+        {"engine.$id": engine.id}, EngineVersion.version == version
     )
     if existing is not None:
         raise ConflictError(
@@ -134,7 +128,7 @@ async def register_version(
         )
 
     doc = EngineVersion(
-        engine_id=engine.id,
+        engine=engine,
         version=version,
         image_repository=repository,
         image_digest=digest,

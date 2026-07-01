@@ -22,8 +22,8 @@ async def recent_games(engine_ids: list[UUID], limit: int = 20) -> list[Game]:
         await Game.find(
             {
                 "$or": [
-                    {"white_id": {"$in": engine_ids}},
-                    {"black_id": {"$in": engine_ids}},
+                    {"white.$id": {"$in": engine_ids}},
+                    {"black.$id": {"$in": engine_ids}},
                 ]
             }
         )
@@ -36,7 +36,7 @@ async def recent_games(engine_ids: list[UUID], limit: int = 20) -> list[Game]:
 async def _latest_version(engine_id: UUID) -> EngineVersion | None:
     """The most recently uploaded image version for an engine, or None."""
     return (
-        await EngineVersion.find(EngineVersion.engine_id == engine_id)
+        await EngineVersion.find({"engine.$id": engine_id})
         .sort("-created_at")
         .first_or_none()
     )
@@ -50,7 +50,7 @@ async def _resolve_version(engine: Engine, version_id: UUID | None) -> EngineVer
             raise NotFoundError(f"engine {engine.name!r} has no uploaded image to play")
         return version
     version = await EngineVersion.get(version_id)
-    if version is None or version.engine_id != engine.id:
+    if version is None or version.engine.ref.id != engine.id:
         raise NotFoundError(f"engine {engine.name!r} has no such version")
     return version
 
@@ -78,8 +78,8 @@ async def start_game(user: User, payload: StartGameRequest) -> StartGameResponse
         )
 
     doc = Game(
-        white_id=white.id,
-        black_id=black.id,
+        white=white,
+        black=black,
         white_name=white.name,
         black_name=black.name,
         white_version=white_version.version,

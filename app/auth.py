@@ -97,7 +97,7 @@ async def mint_token(user: User) -> str:
     """Create a new API token for ``user`` and return its plaintext (once)."""
     plaintext = "mp_" + secrets.token_urlsafe(32)
     await ApiToken(
-        user_id=user.id,
+        user=user,
         token_hash=_hash_token(plaintext),
         prefix=plaintext[:11],
     ).insert()
@@ -106,14 +106,12 @@ async def mint_token(user: User) -> str:
 
 
 async def list_tokens(user: User) -> list[ApiToken]:
-    return (
-        await ApiToken.find(ApiToken.user_id == user.id).sort("-created_at").to_list()
-    )
+    return await ApiToken.find({"user.$id": user.id}).sort("-created_at").to_list()
 
 
 async def revoke_token(user: User, token_id: UUID) -> None:
     token = await ApiToken.get(token_id)
-    if token is None or token.user_id != user.id:
+    if token is None or token.user.ref.id != user.id:
         raise NotFoundError("token not found")
     await token.delete()
     logger.info("revoked api token %s for user=%s", token.prefix, user.login)
@@ -128,7 +126,7 @@ async def user_from_token(plaintext: str) -> User | None:
         return None
     token.last_used_at = utcnow()
     await token.save()
-    return await User.get(token.user_id)
+    return await User.get(token.user.ref.id)
 
 
 # --- current-user resolution (FastAPI dependencies) -------------------------

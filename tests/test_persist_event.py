@@ -4,14 +4,16 @@ import pytest
 
 from machineplay import schemas
 from machineplay.schemas import GameStatus
-from app.models import Game
+from app.models import Engine, Game, User
 from app.streaming import persist_event
 
 
 async def _make_game() -> Game:
+    user = await User(github_id=1, login="p").insert()
+    engine = await Engine(name="e", owner=user, owner_login="p").insert()
     g = Game(
-        white_id=uuid4(),
-        black_id=uuid4(),
+        white=engine,
+        black=engine,
         white_name="white",
         black_name="black",
         white_version="v1",

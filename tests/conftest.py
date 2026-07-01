@@ -22,7 +22,7 @@ async def mongo_client(
 ) -> AsyncIterator[AsyncMongoClient[dict[str, Any]]]:
     url = mongo_container.get_connection_url()
     client: AsyncMongoClient[dict[str, Any]] = AsyncMongoClient(
-        url, tz_aware=True, tzinfo=timezone.utc
+        url, tz_aware=True, tzinfo=timezone.utc, uuidRepresentation="standard"
     )
     await init_beanie(
         database=client["machineplay_test"],

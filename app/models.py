@@ -1,8 +1,8 @@
 from datetime import datetime, timezone
-from typing import Annotated
+from typing import Annotated, cast
 from uuid import UUID, uuid4
 
-from beanie import Document, Indexed
+from beanie import Document, Indexed, Link
 from pydantic import Field
 from pymongo import ASCENDING, IndexModel
 
@@ -17,23 +17,44 @@ class UUIDDocument(Document):
     id: UUID = Field(default_factory=uuid4)  # type: ignore[assignment]
 
 
+class User(UUIDDocument):
+    github_id: Annotated[int, Indexed(unique=True)]
+    login: str
+    name: str | None = None
+    avatar_url: str = ""
+    is_admin: bool = False
+    created_at: datetime = Field(default_factory=utcnow)
+
+
+class ApiToken(UUIDDocument):
+    user: Link[User]
+    # sha256 hex of the plaintext token; the plaintext is shown to the user once
+    # and never stored.
+    token_hash: Annotated[str, Indexed(unique=True)]
+    # First few chars of the plaintext, kept for display ("mp_ab12cd…").
+    prefix: str
+    created_at: datetime = Field(default_factory=utcnow)
+    last_used_at: datetime | None = None
+
+
 class Engine(UUIDDocument):
     name: str
     description: str = ""
-    # Engines are namespaced per owner: (owner_id, name) is unique. owner_login
-    # is denormalized for display, mirroring how Game stores white_name/black_name.
-    owner_id: UUID
+    # Engines are namespaced per owner: (owner, name) is unique. owner_login is
+    # denormalized for display, mirroring how Game stores white_name/black_name.
+    owner: Link[User]
     owner_login: str
     created_at: datetime = Field(default_factory=utcnow)
 
     class Settings:
+        # The unique key is on the link's target id, stored at "owner.$id".
         indexes = [
-            IndexModel([("owner_id", ASCENDING), ("name", ASCENDING)], unique=True)
+            IndexModel([("owner.$id", ASCENDING), ("name", ASCENDING)], unique=True)
         ]
 
 
 class EngineVersion(UUIDDocument):
-    engine_id: UUID
+    engine: Link[Engine]
     version: str
     # Engines are pushed to the docker registry: image_repository is the repo
     # path (e.g. "alice/myengine"), image_digest pins the exact image. The
@@ -45,34 +66,16 @@ class EngineVersion(UUIDDocument):
 
     class Settings:
         indexes = [
-            IndexModel([("engine_id", ASCENDING), ("version", ASCENDING)], unique=True),
+            IndexModel(
+                [("engine.$id", ASCENDING), ("version", ASCENDING)], unique=True
+            ),
             "created_at",
         ]
 
 
-class ApiToken(UUIDDocument):
-    user_id: UUID
-    # sha256 hex of the plaintext token; the plaintext is shown to the user once
-    # and never stored.
-    token_hash: Annotated[str, Indexed(unique=True)]
-    # First few chars of the plaintext, kept for display ("mp_ab12cd…").
-    prefix: str
-    created_at: datetime = Field(default_factory=utcnow)
-    last_used_at: datetime | None = None
-
-
-class User(UUIDDocument):
-    github_id: Annotated[int, Indexed(unique=True)]
-    login: str
-    name: str | None = None
-    avatar_url: str = ""
-    is_admin: bool = False
-    created_at: datetime = Field(default_factory=utcnow)
-
-
 class Game(UUIDDocument):
-    white_id: UUID
-    black_id: UUID
+    white: Link[Engine]
+    black: Link[Engine]
     white_name: str
     black_name: str
     # Which uploaded version each side played.
@@ -87,6 +90,17 @@ class Game(UUIDDocument):
     black_clock: float = 0.0
     created_at: datetime = Field(default_factory=utcnow)
     ended_at: datetime | None = None
+
+    # The engine ids stay in the API surface (GameOut) as plain UUIDs. Games are
+    # loaded without fetch_links, so each side is an unfetched Link: read the
+    # DBRef id straight off it (cast because bson types DBRef.id as Any).
+    @property
+    def white_id(self) -> UUID:
+        return cast(UUID, self.white.ref.id)
+
+    @property
+    def black_id(self) -> UUID:
+        return cast(UUID, self.black.ref.id)
 
     class Settings:
         indexes = ["created_at"]

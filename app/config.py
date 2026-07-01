@@ -63,6 +63,13 @@ class Settings(BaseSettings):
     frontend_url: str = Field(
         default="http://localhost:5173", validation_alias="FRONTEND_URL"
     )
+    # Browser origins allowed by CORS. Credentialed requests (the session
+    # cookie) require explicit origins, so never use "*" here. Override in the
+    # environment as a JSON array: CORS_ORIGINS='["https://machineplay.org"]'.
+    cors_origins: list[str] = Field(
+        default=["http://localhost:5173", "https://machineplay.org"],
+        validation_alias="CORS_ORIGINS",
+    )
 
 
 settings = Settings()

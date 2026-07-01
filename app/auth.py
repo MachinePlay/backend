@@ -30,6 +30,7 @@ import logging
 import re
 import secrets
 from collections.abc import MutableMapping
+from datetime import timedelta
 from typing import Any
 from urllib.parse import urlencode
 from uuid import UUID
@@ -117,16 +118,32 @@ async def revoke_token(user: User, token_id: UUID) -> None:
     logger.info("revoked api token %s for user=%s", token.prefix, user.login)
 
 
+# Refresh a token's last_used_at at most this often. A burst of authenticated
+# requests (e.g. registry pulls during a tournament) then collapses to one write
+# per token per interval instead of one per request. last_used_at is only shown
+# as "last used …" in the token UI, so minute-granularity is plenty.
+LAST_USED_THROTTLE = timedelta(seconds=60)
+
+
 async def user_from_token(plaintext: str) -> User | None:
-    """Resolve a user from a plaintext API token, refreshing its last-used time."""
+    """Resolve a user from a plaintext API token, refreshing its last-used time
+    at most once per ``LAST_USED_THROTTLE``."""
     if not plaintext:
         return None
     token = await ApiToken.find_one(ApiToken.token_hash == _hash_token(plaintext))
     if token is None:
         return None
-    token.last_used_at = utcnow()
-    await token.save()
+    await _touch_last_used(token)
     return await User.get(token.user.ref.id)
+
+
+async def _touch_last_used(token: ApiToken) -> None:
+    """Bump ``last_used_at`` with a targeted ``$set``, skipping the write when the
+    stored value is still within ``LAST_USED_THROTTLE`` of now."""
+    now = utcnow()
+    if token.last_used_at is not None and now - token.last_used_at < LAST_USED_THROTTLE:
+        return
+    await token.set({ApiToken.last_used_at: now})
 
 
 # --- current-user resolution (FastAPI dependencies) -------------------------

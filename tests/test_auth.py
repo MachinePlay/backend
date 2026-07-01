@@ -1,14 +1,15 @@
 import json
 from base64 import b64encode
+from datetime import timedelta
 from typing import Any
 
 from httpx import ASGITransport, AsyncClient
 from itsdangerous import TimestampSigner
 
-from app.auth import mint_token
+from app.auth import LAST_USED_THROTTLE, mint_token, user_from_token
 from app.config import settings
 from app.main import app
-from app.models import Engine, Game, User
+from app.models import ApiToken, Engine, Game, User, utcnow
 
 
 def _client() -> AsyncClient:
@@ -103,6 +104,35 @@ async def test_token_list_and_revoke() -> None:
         assert revoked.status_code == 200
         # The revoked token no longer authenticates.
         assert (await client.get("/me", headers=headers)).status_code == 401
+
+
+async def test_user_from_token_throttles_last_used_writes() -> None:
+    user = await User(github_id=21, login="throttle").insert()
+    plaintext = await mint_token(user)
+
+    async def stored_last_used() -> Any:
+        token = await ApiToken.find_one({"user.$id": user.id})
+        assert token is not None
+        return token.last_used_at
+
+    # First use stamps last_used_at (it was None on mint).
+    assert await user_from_token(plaintext) is not None
+    first = await stored_last_used()
+    assert first is not None
+
+    # A second use within the throttle window must not write again.
+    assert await user_from_token(plaintext) is not None
+    assert await stored_last_used() == first
+
+    # Backdate past the window; the next use refreshes the timestamp.
+    token = await ApiToken.find_one({"user.$id": user.id})
+    assert token is not None
+    stale = utcnow() - LAST_USED_THROTTLE - timedelta(seconds=1)
+    await token.set({ApiToken.last_used_at: stale})
+
+    assert await user_from_token(plaintext) is not None
+    refreshed = await stored_last_used()
+    assert refreshed is not None and refreshed > stale
 
 
 async def test_user_profile() -> None:

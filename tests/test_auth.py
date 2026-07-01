@@ -118,9 +118,9 @@ async def test_user_profile() -> None:
     ).insert()
 
     async with _client() as client:
-        missing = await client.get("/u/nobody")
+        missing = await client.get("/user/nobody")
         assert missing.status_code == 404
-        resp = await client.get("/u/PROFILED")  # case-insensitive
+        resp = await client.get("/user/PROFILED")  # case-insensitive
     assert resp.status_code == 200
     body = resp.json()
     assert body["login"] == "profiled"
@@ -143,8 +143,8 @@ async def test_engine_by_name() -> None:
     ).insert()
 
     async with _client() as client:
-        resp = await client.get("/u/OWNER/MY-BOT")  # case-insensitive
-        missing = await client.get("/u/owner/no-such-engine")
+        resp = await client.get("/user/OWNER/MY-BOT")  # case-insensitive
+        missing = await client.get("/user/owner/no-such-engine")
     assert resp.status_code == 200
     body = resp.json()
     assert body["name"] == "my-bot"

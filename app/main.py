@@ -39,7 +39,47 @@ def _operation_id(route: APIRoute) -> str:
     return route.name
 
 
-app = FastAPI(lifespan=lifespan, generate_unique_id_function=_operation_id)
+API_DESCRIPTION = """
+Backend for **[MachinePlay](https://machineplay.org)**.
+
+Users upload UCI chess engines as Docker images; runners pull them from a
+private registry and play games via
+[fastchess](https://github.com/Disservin/fastchess), streamed live to the
+browser over Server-Sent Events.
+"""
+
+# Groups the routes into named sections in the Swagger UI; each `name` matches
+# the `tags=[...]` on the corresponding router in `app/routes.py`.
+TAGS_METADATA = [
+    {
+        "name": "Auth & account",
+        "description": "GitHub OAuth login, the logged-in account, session and "
+        "CLI tokens, and the Docker registry token endpoint.",
+    },
+    {
+        "name": "Engines & profiles",
+        "description": "Public user profiles and the engines they've uploaded.",
+    },
+    {
+        "name": "Games & runners",
+        "description": "Start games, browse results, and see the connected "
+        "runners that play them.",
+    },
+    {
+        "name": "Live streaming",
+        "description": "Server-Sent Events for live game updates and the runner "
+        "WebSocket.",
+    },
+]
+
+app = FastAPI(
+    title="MachinePlay API",
+    description=API_DESCRIPTION,
+    version="0.1.0",
+    openapi_tags=TAGS_METADATA,
+    lifespan=lifespan,
+    generate_unique_id_function=_operation_id,
+)
 
 app.add_middleware(
     CORSMiddleware,

@@ -73,6 +73,23 @@ class EngineVersion(UUIDDocument):
         ]
 
 
+class Runner(UUIDDocument):
+    # Durable record of a runner. The in-memory RunnerConnection (app/runners.py)
+    # only tracks live state (online presence + scheduling); everything worth
+    # keeping across restarts/disconnects lives here. Owner is denormalized the
+    # same way Engine denormalizes owner_login for display.
+    owner: Link[User]
+    owner_login: str
+    # Seeded from the runner's hostname on first connect; owner-editable after.
+    name: str
+    description: str = ""
+    # Last capacity the runner reported (intro.max_games); kept for display even
+    # while the runner is offline.
+    max_games: int = 0
+    created_at: datetime = Field(default_factory=utcnow)
+    last_seen_at: datetime | None = None
+
+
 class Game(UUIDDocument):
     white: Link[Engine]
     black: Link[Engine]

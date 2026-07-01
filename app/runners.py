@@ -1,0 +1,161 @@
+"""Runners: durable identity/metadata (the ``Runner`` document) plus the live
+in-memory connections.
+
+A runner is a durable record (owner, name, description) so it survives restarts
+and disconnects. Only its *live* state — the scheduling queue and the games it
+is currently playing while its WebSocket is up — lives in memory here, keyed by
+runner id. "Online" means present in the ``_online`` map.
+"""
+
+import asyncio
+import logging
+from uuid import UUID
+
+from machineplay import schemas
+
+from app.exceptions import ForbiddenError, NotFoundError
+from app.models import Runner as RunnerDoc, User, utcnow
+from app.schemas import RunnerOut, RunnerUpdateRequest
+
+logger = logging.getLogger(__name__)
+
+
+class RunnerConnection:
+    """Live state of one connected runner: its command queue and in-flight games.
+
+    Durable identity/metadata lives on the ``Runner`` document; this exists only
+    while the runner's WebSocket is up.
+    """
+
+    def __init__(self, runner_id: UUID, max_games: int):
+        self.runner_id = runner_id
+        self.max_games = max_games
+        self.scheduled_commands: asyncio.Queue[schemas.ServerCommand] = asyncio.Queue()
+        self._game_ids: set[UUID] = set()
+
+    @property
+    def active_games(self) -> int:
+        return len(self._game_ids)
+
+    def is_full(self) -> bool:
+        return len(self._game_ids) >= self.max_games
+
+    def track_game(self, game_id: UUID) -> None:
+        self._game_ids.add(game_id)
+
+    def untrack_game(self, game_id: UUID) -> None:
+        self._game_ids.discard(game_id)
+
+    def game_ids(self) -> list[UUID]:
+        return list(self._game_ids)
+
+
+# Live connections keyed by runner id. Presence here == online.
+_online: dict[UUID, RunnerConnection] = {}
+
+
+def mark_online(runner_id: UUID, max_games: int) -> RunnerConnection:
+    conn = RunnerConnection(runner_id, max_games)
+    _online[runner_id] = conn
+    return conn
+
+
+def mark_offline(runner_id: UUID) -> RunnerConnection | None:
+    return _online.pop(runner_id, None)
+
+
+def get_online(runner_id: UUID) -> RunnerConnection:
+    try:
+        return _online[runner_id]
+    except KeyError:
+        raise NotFoundError(
+            "runner is not online", details={"runner_id": str(runner_id)}
+        )
+
+
+async def upsert_on_connect(
+    user: User, runner_id: UUID, name: str, max_games: int
+) -> RunnerDoc | None:
+    """Create the runner's doc on first connect, or refresh it on reconnect.
+
+    Owner-managed fields (name, description) are set once at creation and left
+    alone afterwards so the owner's edits survive reconnects. Returns None if the
+    runner id already belongs to a different owner (an id can't be hijacked).
+    """
+    doc = await RunnerDoc.get(runner_id)
+    now = utcnow()
+    if doc is None:
+        doc = RunnerDoc(
+            id=runner_id,
+            owner=user,
+            owner_login=user.login,
+            name=name,
+            max_games=max_games,
+            last_seen_at=now,
+        )
+        await doc.insert()
+        logger.info("registered new runner id=%s owner=%s", runner_id, user.login)
+        return doc
+    if doc.owner.ref.id != user.id:
+        logger.warning(
+            "runner id=%s owned by %s; rejecting connect from %s",
+            runner_id,
+            doc.owner_login,
+            user.login,
+        )
+        return None
+    doc.max_games = max_games
+    doc.last_seen_at = now
+    await doc.save()
+    return doc
+
+
+async def touch_last_seen(runner_id: UUID) -> None:
+    await RunnerDoc.find_one(RunnerDoc.id == runner_id).update(
+        {"$set": {"last_seen_at": utcnow()}}
+    )
+
+
+def _to_out(doc: RunnerDoc) -> RunnerOut:
+    conn = _online.get(doc.id)
+    return RunnerOut(
+        runner_id=doc.id,
+        name=doc.name,
+        description=doc.description,
+        owner_login=doc.owner_login,
+        online=conn is not None,
+        max_games=doc.max_games,
+        active_games=conn.active_games if conn is not None else 0,
+        last_seen_at=doc.last_seen_at,
+    )
+
+
+async def list_runners() -> list[RunnerOut]:
+    """All runners, durable metadata joined with live online status."""
+    docs = await RunnerDoc.find_all().sort("+created_at").to_list()
+    return [_to_out(doc) for doc in docs]
+
+
+async def get_runner(runner_id: UUID) -> RunnerOut:
+    """One runner's durable metadata joined with its live online status."""
+    doc = await RunnerDoc.get(runner_id)
+    if doc is None:
+        raise NotFoundError("runner not found", details={"runner_id": str(runner_id)})
+    return _to_out(doc)
+
+
+async def edit_runner(
+    user: User, runner_id: UUID, patch: RunnerUpdateRequest
+) -> RunnerOut:
+    """Owner-only edit of a runner's name/description."""
+    doc = await RunnerDoc.get(runner_id)
+    if doc is None:
+        raise NotFoundError("runner not found", details={"runner_id": str(runner_id)})
+    if doc.owner.ref.id != user.id:
+        raise ForbiddenError("only the runner's owner can edit it")
+    if patch.name is not None:
+        doc.name = patch.name
+    if patch.description is not None:
+        doc.description = patch.description
+    await doc.save()
+    return _to_out(doc)

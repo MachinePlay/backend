@@ -5,7 +5,7 @@ from uuid import UUID
 
 from machineplay import schemas
 
-from app import streaming
+from app import runners, streaming
 from app.config import settings
 from app.exceptions import NotFoundError, RunnerBusyError
 from app.models import Engine, EngineVersion, Game, User
@@ -66,7 +66,7 @@ async def start_game(user: User, payload: StartGameRequest) -> StartGameResponse
     white_version = await _resolve_version(white, payload.white_version_id)
     black_version = await _resolve_version(black, payload.black_version_id)
 
-    runner = streaming.runners.get_runner(payload.runner_id)
+    runner = runners.get_online(payload.runner_id)
 
     if runner.is_full():
         raise RunnerBusyError(

@@ -149,13 +149,19 @@ async def _touch_last_used(token: ApiToken) -> None:
 # --- current-user resolution (FastAPI dependencies) -------------------------
 
 
-async def _user_from_bearer(request: Request) -> User | None:
-    """Resolve a user from an ``Authorization: Bearer <token>`` header, or None."""
-    header = request.headers.get("Authorization", "")
+async def user_from_auth_header(header: str) -> User | None:
+    """Resolve a user from an ``Authorization: Bearer <token>`` header value, or
+    None. Works off the raw header string so both HTTP requests and the runner
+    WebSocket handshake can share it."""
     scheme, _, plaintext = header.partition(" ")
     if scheme.lower() != "bearer" or not plaintext:
         return None
     return await user_from_token(plaintext)
+
+
+async def _user_from_bearer(request: Request) -> User | None:
+    """Resolve a user from an ``Authorization: Bearer <token>`` header, or None."""
+    return await user_from_auth_header(request.headers.get("Authorization", ""))
 
 
 async def get_current_user(request: Request) -> User | None:

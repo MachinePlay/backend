@@ -23,10 +23,23 @@ class StartGameResponse(BaseModel):
 
 
 class RunnerOut(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
-
+    # runner_id is the runner's stable doc id (kept as `runner_id`, not `id`, so
+    # the frontend and StartGameRequest agree on the field name). `online` is the
+    # live status; `active_games` is only meaningful while online.
     runner_id: UUID
     name: str
+    description: str
+    owner_login: str
+    online: bool
+    max_games: int
+    active_games: int = 0
+    last_seen_at: datetime | None = None
+
+
+class RunnerUpdateRequest(BaseModel):
+    # Owner-editable metadata. Omitted fields are left unchanged.
+    name: str | None = None
+    description: str | None = None
 
 
 class UserOut(BaseModel):

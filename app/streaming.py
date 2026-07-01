@@ -8,6 +8,7 @@ from fastapi import WebSocket, WebSocketDisconnect
 from machineplay import schemas
 from machineplay.schemas import GameStatus
 
+from app import auth, runners
 from app.exceptions import NotFoundError
 from app.models import Game as GameDoc, utcnow
 from app.schemas import LiveStreamEvent
@@ -208,77 +209,40 @@ class GameRegistry:
         return self.registry.pop(game_id, None)
 
 
-class Runner:
-    def __init__(self, runner_id: UUID, name: str, max_games: int):
-        self.runner_id = runner_id
-        self.name = name
-        self.max_games = max_games
-        self.scheduled_commands: asyncio.Queue[schemas.ServerCommand] = asyncio.Queue()
-        self._game_ids: set[UUID] = set()
-
-    @property
-    def active_games(self) -> int:
-        return len(self._game_ids)
-
-    def is_full(self) -> bool:
-        return len(self._game_ids) >= self.max_games
-
-    def track_game(self, game_id: UUID) -> None:
-        self._game_ids.add(game_id)
-
-    def untrack_game(self, game_id: UUID) -> None:
-        self._game_ids.discard(game_id)
-
-    async def abort_games(self) -> None:
-        for game_id in list(self._game_ids):
-            await abort_game(game_id)
-        self._game_ids.clear()
-
-
-class Runners:
-    def __init__(self) -> None:
-        self.data: dict[UUID, Runner] = {}
-
-    def register_runner(self, runner_id: UUID, name: str, max_games: int) -> Runner:
-        new_runner = Runner(runner_id, name, max_games=max_games)
-        self.data[runner_id] = new_runner
-        return new_runner
-
-    def unregister_runner(self, runner_id: UUID) -> None:
-        self.data.pop(runner_id, None)
-
-    def get_runner(self, runner_id: UUID) -> Runner:
-        try:
-            return self.data[runner_id]
-        except KeyError:
-            raise NotFoundError(
-                "no runner with this id is running",
-                details={"runner_id": str(runner_id)},
-            )
-
-    def list_runners(self) -> list[Runner]:
-        return list(self.data.values())
-
-
 game_registry = GameRegistry()
 live_stream = LiveStream()
-runners = Runners()
 
 
 async def runner_session(ws: WebSocket) -> None:
-    """Lifecycle of one connected runner: register it, pump game events from
-    the socket into persistence + fan-out, pump scheduled commands back, and
-    abort its games when it disconnects."""
+    """Lifecycle of one connected runner: authenticate it, upsert its durable
+    record, mark it online, pump game events from the socket into persistence +
+    fan-out, pump scheduled commands back, and abort its games + mark it offline
+    when it disconnects."""
+    # Authenticate on the handshake (before accept) so an unknown token is a 403
+    # rejection rather than an accepted-then-closed socket.
+    user = await auth.user_from_auth_header(ws.headers.get("Authorization", ""))
+    if user is None:
+        logger.warning("runner WS rejected: missing/invalid bearer token")
+        await ws.close(code=1008)
+        return
+
     await ws.accept()
 
     intro = schemas.Introduction.model_validate_json(await ws.receive_text())
-    runner = runners.register_runner(
-        intro.runner_id, intro.name, max_games=intro.max_games
+    doc = await runners.upsert_on_connect(
+        user, intro.runner_id, intro.name, intro.max_games
     )
+    if doc is None:
+        # Runner id belongs to someone else — refuse to let them impersonate it.
+        await ws.close(code=1008)
+        return
+
+    runner = runners.mark_online(intro.runner_id, intro.max_games)
     logger.info(
-        "runner connected id=%s name=%s max_games=%d",
+        "runner connected id=%s name=%s owner=%s max_games=%d",
         intro.runner_id,
-        intro.name,
+        doc.name,
+        user.login,
         intro.max_games,
     )
 
@@ -320,8 +284,13 @@ async def runner_session(ws: WebSocket) -> None:
     finally:
         recv_task.cancel()
         send_task.cancel()
-        await runner.abort_games()
-        runners.unregister_runner(intro.runner_id)
+        # Take the runner offline first so nothing new gets scheduled onto it,
+        # then abort whatever it was mid-game on. The durable doc stays; only the
+        # live connection goes away.
+        runners.mark_offline(intro.runner_id)
+        for game_id in runner.game_ids():
+            await abort_game(game_id)
+        await runners.touch_last_seen(intro.runner_id)
 
 
 async def game_event_stream(game_id: UUID) -> AsyncIterator[schemas.GameStreamEvent]:

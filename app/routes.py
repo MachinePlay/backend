@@ -18,7 +18,7 @@ from fastapi.sse import EventSourceResponse
 
 from machineplay import schemas
 
-from app import auth, engines, games, registry, streaming, users
+from app import auth, engines, games, registry, runners, streaming, users
 from app.models import ApiToken, Game, User
 from app.schemas import (
     ApiTokenOut,
@@ -32,6 +32,7 @@ from app.schemas import (
     RegisterRequest,
     RegistryTokenOut,
     RunnerOut,
+    RunnerUpdateRequest,
     StartGameRequest,
     StartGameResponse,
     TokenOut,
@@ -151,8 +152,25 @@ games_router = APIRouter(tags=["Games & runners"])
 
 
 @games_router.get("/runners", response_model=list[RunnerOut])
-async def list_runners() -> list[streaming.Runner]:
-    return streaming.runners.list_runners()
+async def list_runners() -> list[RunnerOut]:
+    """All registered runners, durable metadata joined with live online status."""
+    return await runners.list_runners()
+
+
+@games_router.get("/runner/{runner_id}", response_model=RunnerOut)
+async def get_runner(runner_id: UUID) -> RunnerOut:
+    """One runner's durable metadata joined with its live online status."""
+    return await runners.get_runner(runner_id)
+
+
+@games_router.patch("/runner/{runner_id}", response_model=RunnerOut)
+async def update_runner(
+    runner_id: UUID,
+    payload: RunnerUpdateRequest,
+    user: User = Depends(auth.require_user),
+) -> RunnerOut:
+    """Edit a runner's name/description (owner only)."""
+    return await runners.edit_runner(user, runner_id, payload)
 
 
 @games_router.post("/game")

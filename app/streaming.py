@@ -11,7 +11,7 @@ from machineplay.schemas import GameStatus
 from app import auth, runners
 from app.exceptions import NotFoundError
 from app.models import Game as GameDoc, utcnow
-from app.schemas import LiveStreamEvent
+from app.schemas import LiveStreamEvent, RunnerLiveEvent
 
 logger = logging.getLogger(__name__)
 
@@ -188,6 +188,35 @@ class LiveStream:
                 )
 
 
+class RunnerStream:
+    """Fans out runner live-status events (RunnerLiveEvent) to all subscribers.
+
+    Simpler than LiveStream: no tracking/promotion, just a broadcast bus. The
+    runner_session pushes an event on connect, on each telemetry sample, and on
+    disconnect; every SSE subscriber gets a copy keyed by runner id.
+    """
+
+    def __init__(self) -> None:
+        self.subscribers: set[asyncio.Queue[RunnerLiveEvent]] = set()
+
+    def subscribe(self) -> asyncio.Queue[RunnerLiveEvent]:
+        q: asyncio.Queue[RunnerLiveEvent] = asyncio.Queue(maxsize=256)
+        self.subscribers.add(q)
+        logger.info("runner stream subscriber added, total=%d", len(self.subscribers))
+        return q
+
+    def unsubscribe(self, q: asyncio.Queue[RunnerLiveEvent]) -> None:
+        self.subscribers.discard(q)
+        logger.info("runner stream subscriber removed, total=%d", len(self.subscribers))
+
+    def broadcast(self, event: RunnerLiveEvent) -> None:
+        for q in self.subscribers:
+            try:
+                q.put_nowait(event)
+            except asyncio.QueueFull:
+                logger.warning("runner stream queue full, dropping event")
+
+
 class GameRegistry:
     def __init__(self) -> None:
         self.registry: dict[UUID, Game] = {}
@@ -211,6 +240,7 @@ class GameRegistry:
 
 game_registry = GameRegistry()
 live_stream = LiveStream()
+runner_stream = RunnerStream()
 
 
 async def runner_session(ws: WebSocket) -> None:
@@ -230,7 +260,7 @@ async def runner_session(ws: WebSocket) -> None:
 
     intro = schemas.Introduction.model_validate_json(await ws.receive_text())
     doc = await runners.upsert_on_connect(
-        user, intro.runner_id, intro.name, intro.max_games
+        user, intro.runner_id, intro.name, intro.max_games, intro.hardware
     )
     if doc is None:
         # Runner id belongs to someone else — refuse to let them impersonate it.
@@ -238,6 +268,7 @@ async def runner_session(ws: WebSocket) -> None:
         return
 
     runner = runners.mark_online(intro.runner_id, intro.max_games)
+    runner_stream.broadcast(runners.live_event(runner))
     logger.info(
         "runner connected id=%s name=%s owner=%s max_games=%d",
         intro.runner_id,
@@ -263,6 +294,11 @@ async def runner_session(ws: WebSocket) -> None:
                     await persist_event(game_id, event)
                     await game.broadcast(event)
                     await live_stream.broadcast(game_id, event)
+                case schemas.Telemetry() as telemetry:
+                    runner.update_telemetry(telemetry)
+                    runner_stream.broadcast(runners.live_event(runner))
+                case schemas.Introduction():
+                    logger.warning("unexpected duplicate intro from runner")
 
     async def sender() -> None:
         while True:
@@ -288,6 +324,14 @@ async def runner_session(ws: WebSocket) -> None:
         # then abort whatever it was mid-game on. The durable doc stays; only the
         # live connection goes away.
         runners.mark_offline(intro.runner_id)
+        runner_stream.broadcast(
+            RunnerLiveEvent(
+                runner_id=intro.runner_id,
+                online=False,
+                active_games=0,
+                telemetry=None,
+            )
+        )
         for game_id in runner.game_ids():
             await abort_game(game_id)
         await runners.touch_last_seen(intro.runner_id)
@@ -346,3 +390,21 @@ async def live_event_stream() -> AsyncIterator[LiveStreamEvent]:
             yield LiveStreamEvent(game_id=game_id, event=event)
     finally:
         live_stream.unsubscribe(q)
+
+
+async def runner_event_stream() -> AsyncIterator[RunnerLiveEvent]:
+    """Event source for the runners SSE endpoint: a snapshot of every online
+    runner's current status, then live connect/telemetry/disconnect events.
+
+    Subscribe before snapshotting so nothing is missed in the gap; a runner that
+    both appears in the snapshot and emits a live event just gets merged twice on
+    the client (keyed by runner id), which is harmless.
+    """
+    q = runner_stream.subscribe()
+    try:
+        for event in runners.live_snapshot():
+            yield event
+        while True:
+            yield await q.get()
+    finally:
+        runner_stream.unsubscribe(q)

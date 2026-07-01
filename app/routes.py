@@ -31,6 +31,7 @@ from app.schemas import (
     PendingSignupOut,
     RegisterRequest,
     RegistryTokenOut,
+    RunnerLiveEvent,
     RunnerOut,
     RunnerUpdateRequest,
     StartGameRequest,
@@ -220,6 +221,16 @@ async def sse_stream(game_id: UUID) -> AsyncIterable[schemas.GameStreamEvent]:
 )
 async def sse_live_stream() -> AsyncIterable[LiveStreamEvent]:
     async for event in streaming.live_event_stream():
+        yield event
+
+
+@streaming_router.get(
+    "/stream/runners",
+    response_class=EventSourceResponse,
+    responses={200: {"model": RunnerLiveEvent}},
+)
+async def sse_runner_stream() -> AsyncIterable[RunnerLiveEvent]:
+    async for event in streaming.runner_event_stream():
         yield event
 
 

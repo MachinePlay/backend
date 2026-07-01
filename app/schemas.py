@@ -3,7 +3,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict
 
-from machineplay.schemas import GameStatus, GameStreamEvent
+from machineplay.schemas import GameStatus, GameStreamEvent, HardwareInfo, Telemetry
 
 
 class StartGameRequest(BaseModel):
@@ -34,6 +34,20 @@ class RunnerOut(BaseModel):
     max_games: int
     active_games: int = 0
     last_seen_at: datetime | None = None
+    # Static hardware (CPU/RAM); shown even when offline. `telemetry` is the last
+    # live utilization sample, present only while online.
+    hardware: HardwareInfo | None = None
+    telemetry: Telemetry | None = None
+
+
+class RunnerLiveEvent(BaseModel):
+    """One runner's live status, pushed over the /stream/runners SSE feed on
+    connect, on each telemetry sample, and on disconnect."""
+
+    runner_id: UUID
+    online: bool
+    active_games: int
+    telemetry: Telemetry | None = None
 
 
 class RunnerUpdateRequest(BaseModel):

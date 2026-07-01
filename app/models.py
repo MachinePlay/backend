@@ -6,7 +6,7 @@ from beanie import Document, Indexed, Link
 from pydantic import Field
 from pymongo import ASCENDING, IndexModel
 
-from machineplay.schemas import GameStatus
+from machineplay.schemas import GameStatus, HardwareInfo
 
 
 def utcnow() -> datetime:
@@ -86,6 +86,9 @@ class Runner(UUIDDocument):
     # Last capacity the runner reported (intro.max_games); kept for display even
     # while the runner is offline.
     max_games: int = 0
+    # Static hardware description last reported in the runner's Introduction;
+    # kept for display while offline. Optional so pre-hardware docs still load.
+    hardware: HardwareInfo | None = None
     created_at: datetime = Field(default_factory=utcnow)
     last_seen_at: datetime | None = None
 

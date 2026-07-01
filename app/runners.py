@@ -15,7 +15,7 @@ from machineplay import schemas
 
 from app.exceptions import ForbiddenError, NotFoundError
 from app.models import Runner as RunnerDoc, User, utcnow
-from app.schemas import RunnerOut, RunnerUpdateRequest
+from app.schemas import RunnerLiveEvent, RunnerOut, RunnerUpdateRequest
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +32,8 @@ class RunnerConnection:
         self.max_games = max_games
         self.scheduled_commands: asyncio.Queue[schemas.ServerCommand] = asyncio.Queue()
         self._game_ids: set[UUID] = set()
+        # Last utilization sample; live-only, so it dies with the connection.
+        self.latest_telemetry: schemas.Telemetry | None = None
 
     @property
     def active_games(self) -> int:
@@ -49,9 +51,27 @@ class RunnerConnection:
     def game_ids(self) -> list[UUID]:
         return list(self._game_ids)
 
+    def update_telemetry(self, telemetry: schemas.Telemetry) -> None:
+        self.latest_telemetry = telemetry
+
 
 # Live connections keyed by runner id. Presence here == online.
 _online: dict[UUID, RunnerConnection] = {}
+
+
+def live_event(conn: RunnerConnection) -> RunnerLiveEvent:
+    """The live status of an online runner, for the /stream/runners feed."""
+    return RunnerLiveEvent(
+        runner_id=conn.runner_id,
+        online=True,
+        active_games=conn.active_games,
+        telemetry=conn.latest_telemetry,
+    )
+
+
+def live_snapshot() -> list[RunnerLiveEvent]:
+    """Current live status of every online runner (SSE bootstrap)."""
+    return [live_event(conn) for conn in _online.values()]
 
 
 def mark_online(runner_id: UUID, max_games: int) -> RunnerConnection:
@@ -74,12 +94,17 @@ def get_online(runner_id: UUID) -> RunnerConnection:
 
 
 async def upsert_on_connect(
-    user: User, runner_id: UUID, name: str, max_games: int
+    user: User,
+    runner_id: UUID,
+    name: str,
+    max_games: int,
+    hardware: schemas.HardwareInfo,
 ) -> RunnerDoc | None:
     """Create the runner's doc on first connect, or refresh it on reconnect.
 
     Owner-managed fields (name, description) are set once at creation and left
-    alone afterwards so the owner's edits survive reconnects. Returns None if the
+    alone afterwards so the owner's edits survive reconnects. Runner-reported
+    fields (max_games, hardware) are refreshed each connect. Returns None if the
     runner id already belongs to a different owner (an id can't be hijacked).
     """
     doc = await RunnerDoc.get(runner_id)
@@ -91,6 +116,7 @@ async def upsert_on_connect(
             owner_login=user.login,
             name=name,
             max_games=max_games,
+            hardware=hardware,
             last_seen_at=now,
         )
         await doc.insert()
@@ -105,6 +131,7 @@ async def upsert_on_connect(
         )
         return None
     doc.max_games = max_games
+    doc.hardware = hardware
     doc.last_seen_at = now
     await doc.save()
     return doc
@@ -127,6 +154,8 @@ def _to_out(doc: RunnerDoc) -> RunnerOut:
         max_games=doc.max_games,
         active_games=conn.active_games if conn is not None else 0,
         last_seen_at=doc.last_seen_at,
+        hardware=doc.hardware,
+        telemetry=conn.latest_telemetry if conn is not None else None,
     )
 
 

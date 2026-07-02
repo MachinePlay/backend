@@ -3,7 +3,7 @@ from uuid import uuid4
 from httpx import ASGITransport, AsyncClient
 from machineplay import schemas as ws_schemas
 
-from app import runners, streaming
+from app import games, runners, streaming
 from app.auth import mint_token
 from app.main import app
 from app.models import Engine, EngineVersion, Game, Runner, User
@@ -111,6 +111,8 @@ async def test_start_game_schedules_and_persists() -> None:
         assert doc.runner_id == conn.runner_id
         assert doc.white_version_id == version.id
         assert doc.black_version_id == version.id
+        # Scheduling flipped the game from PENDING to PLAYING.
+        assert doc.status == ws_schemas.GameStatus.PLAYING
 
         # The slot is reserved and the start command is queued with the tc.
         assert conn.active_games == 1
@@ -122,6 +124,32 @@ async def test_start_game_schedules_and_persists() -> None:
             streaming.game_registry.unregister(doc.id)
             conn.untrack_game(doc.id)
         runners.mark_offline(conn)
+
+
+async def test_create_game_pending_until_scheduled() -> None:
+    _, user, engine, version = await _setup()
+    # create_game pins the pairing but leaves it PENDING — not on any runner yet.
+    doc = await games.create_game(engine, engine, version, version, tc="10+0.1")
+    try:
+        assert doc.status == ws_schemas.GameStatus.PENDING
+        fetched = await Game.get(doc.id)
+        assert fetched is not None
+        assert fetched.status == ws_schemas.GameStatus.PENDING
+
+        conn = await _online_runner(user, max_games=1)
+        try:
+            await games.schedule_game(doc, conn, version, version)
+            # The slot is reserved and the doc is flipped to PLAYING.
+            assert conn.active_games == 1
+            scheduled = await Game.get(doc.id)
+            assert scheduled is not None
+            assert scheduled.status == ws_schemas.GameStatus.PLAYING
+        finally:
+            streaming.game_registry.unregister(doc.id)
+            conn.untrack_game(doc.id)
+            runners.mark_offline(conn)
+    finally:
+        await doc.delete()
 
 
 async def test_start_game_full_runner_rejected_without_orphan_doc() -> None:

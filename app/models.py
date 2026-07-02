@@ -109,7 +109,10 @@ class Game(UUIDDocument):
     tc: str | None = None
     # Set when the game belongs to a tournament (M8).
     tournament_id: UUID | None = None
-    status: GameStatus = GameStatus.PLAYING
+    # A freshly-created game is PENDING until a runner slot is reserved for it
+    # (schedule_game flips it to PLAYING). Defaulting to PENDING keeps a
+    # not-yet-dispatched game from being treated as live or aborted-on-restart.
+    status: GameStatus = GameStatus.PENDING
     result: str | None = None
     # How the game terminated ("time forfeit", "cancelled", "runner
     # disconnected", …); None for a plain finish.

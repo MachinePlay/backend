@@ -254,6 +254,7 @@ async def _playing_game(owner: User) -> Game:
         black_name="e",
         white_version="v1",
         black_version="v1",
+        status=ws_schemas.GameStatus.PLAYING,
     ).insert()
 
 

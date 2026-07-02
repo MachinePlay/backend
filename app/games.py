@@ -78,7 +78,8 @@ async def create_game(
 ) -> Game:
     """Insert a Game doc with everything pinned (engines, exact versions, tc).
 
-    The game is not scheduled yet; pass it to `schedule_game` to start it.
+    The game is inserted PENDING (not scheduled yet); pass it to `schedule_game`
+    to reserve a runner slot and flip it to PLAYING.
     """
     if not TC_RE.fullmatch(tc):
         raise ConflictError(f"invalid time control {tc!r} (expected 'base+inc')")
@@ -124,7 +125,8 @@ async def schedule_game(
     white_version: EngineVersion,
     black_version: EngineVersion,
 ) -> None:
-    """Reserve a slot on `runner` and send it the start command.
+    """Reserve a slot on `runner`, send it the start command, and mark the game
+    PLAYING.
 
     The capacity check and the slot reservation (`track_game`) happen with no
     await between them, so concurrent schedulers can't oversubscribe a runner.
@@ -158,6 +160,14 @@ async def schedule_game(
         raise NotFoundError(
             "runner went offline", details={"runner_id": str(runner.runner_id)}
         )
+
+    # The game now holds a runner slot: flip PENDING → PLAYING. Guarded on
+    # PENDING so a terminal end that raced ahead (e.g. an instant pull failure
+    # reported before this returns) isn't clobbered back to PLAYING.
+    await Game.find_one(
+        Game.id == doc.id, Game.status == schemas.GameStatus.PENDING
+    ).update({"$set": {"status": schemas.GameStatus.PLAYING}})
+    doc.status = schemas.GameStatus.PLAYING
     logger.info("scheduled game=%s on runner=%s", doc.id, runner.runner_id)
 
 

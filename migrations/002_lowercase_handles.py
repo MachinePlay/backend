@@ -1,9 +1,12 @@
 """One-off migration: lowercase user handles and their denormalized copies.
 
 Handles created before the pick-a-handle registration flow kept GitHub's
-casing (e.g. "Saegl"); lookups now expect stored-lowercase values. Run from
-the `backend/` directory: `uv run python scripts/lowercase_handles.py`.
+casing (e.g. "Saegl"); lookups now expect stored-lowercase values.
 Idempotent — already-lowercase docs are left untouched.
+
+Run from ``backend/`` (``PYTHONPATH=.`` so ``app`` imports resolve)::
+
+    PYTHONPATH=. uv run python migrations/002_lowercase_handles.py
 """
 
 import asyncio

@@ -1,9 +1,10 @@
 from datetime import datetime, timezone
+from enum import StrEnum
 from typing import Annotated, cast
 from uuid import UUID, uuid4
 
 from beanie import Document, Indexed, Link
-from pydantic import Field
+from pydantic import BaseModel, Field
 from pymongo import ASCENDING, IndexModel
 
 from machineplay.schemas import GameStatus, HardwareInfo
@@ -144,4 +145,57 @@ class Game(UUIDDocument):
             IndexModel([("white.$id", ASCENDING)]),
             IndexModel([("black.$id", ASCENDING)]),
             "tournament_id",
+        ]
+
+
+class TournamentFormat(StrEnum):
+    # Every unordered pair plays; one engine plays all the others, respectively.
+    ROUND_ROBIN = "round_robin"
+    GAUNTLET = "gauntlet"
+
+
+class TournamentStatus(StrEnum):
+    # A tournament starts RUNNING (creation dispatches its first pairings) and
+    # ends COMPLETED once every pairing has a result, or ABORTED if cancelled.
+    RUNNING = "running"
+    COMPLETED = "completed"
+    ABORTED = "aborted"
+
+
+class TournamentParticipant(BaseModel):
+    # One entrant, with its engine version pinned at tournament-creation time so
+    # a mid-tournament upload can't change which binary plays (and so per-version
+    # ELO stays attributable later). Names/version strings are denormalized for
+    # display, mirroring how Game stores white_name/white_version.
+    engine_id: UUID
+    engine_name: str
+    version_id: UUID
+    version: str
+
+
+class Tournament(UUIDDocument):
+    name: str
+    # Creator, denormalized like Engine.owner_login / Runner.owner_login.
+    creator_id: UUID
+    created_by: str
+    # Every game plays on this one runner (same hardware => fair), pinned here.
+    runner_id: UUID
+    tc: str
+    format: TournamentFormat
+    # Games each pairing plays; colors alternate across them. Odd values are
+    # allowed (an intentionally color-lopsided tournament).
+    games_per_pairing: int
+    # The engine that plays everyone else (GAUNTLET only; None for round robin).
+    gauntlet_head_id: UUID | None = None
+    participants: list[TournamentParticipant] = Field(default_factory=list)
+    status: TournamentStatus = TournamentStatus.RUNNING
+    created_at: datetime = Field(default_factory=utcnow)
+    ended_at: datetime | None = None
+
+    class Settings:
+        # (runner_id, status) backs the resume-on-reconnect query; created_at
+        # backs the list view.
+        indexes = [
+            "created_at",
+            IndexModel([("runner_id", ASCENDING), ("status", ASCENDING)]),
         ]

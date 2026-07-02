@@ -66,6 +66,11 @@ TAGS_METADATA = [
         "runners that play them.",
     },
     {
+        "name": "Tournaments",
+        "description": "Round-robin and gauntlet tournaments: create one on a "
+        "runner and watch its pairings play out with live standings.",
+    },
+    {
         "name": "Live streaming",
         "description": "Server-Sent Events for live game updates and the runner "
         "WebSocket.",

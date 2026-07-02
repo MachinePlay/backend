@@ -49,6 +49,10 @@ async def runner_session(ws: WebSocket) -> None:
         user.login,
         intro.max_games,
     )
+    # Let schedulers resume work pinned to this runner (tournaments re-queue and
+    # dispatch their pending pairings). Enqueues onto scheduled_commands, which
+    # the sender below drains once it starts.
+    await runners.notify_connected(intro.runner_id)
 
     async def receiver() -> None:
         while True:

@@ -18,7 +18,7 @@ from fastapi.sse import EventSourceResponse
 
 from machineplay import schemas
 
-from app import auth, engines, games, registry, runners, streaming, users
+from app import auth, engines, games, registry, runners, streaming, tournaments, users
 from app.models import ApiToken, Game, User
 from app.schemas import (
     ApiTokenOut,
@@ -37,6 +37,9 @@ from app.schemas import (
     StartGameRequest,
     StartGameResponse,
     TokenOut,
+    TournamentCreateRequest,
+    TournamentDetailOut,
+    TournamentOut,
     UserOut,
     UserProfileOut,
 )
@@ -200,6 +203,44 @@ async def get_game(game_id: UUID) -> Game:
     return await games.get_game(game_id)
 
 
+# --- tournaments --------------------------------------------------------------
+
+tournaments_router = APIRouter(tags=["Tournaments"])
+
+
+@tournaments_router.post("/tournament", response_model=TournamentDetailOut)
+async def create_tournament(
+    payload: TournamentCreateRequest, user: User = Depends(auth.require_user)
+) -> TournamentDetailOut:
+    """Create a tournament and start dispatching its pairings onto the runner."""
+    tour = await tournaments.create_tournament(user, payload)
+    return await tournaments.tournament_detail(tour.id)
+
+
+@tournaments_router.get("/tournament", response_model=list[TournamentOut])
+async def list_tournaments(
+    limit: int = Query(default=50, ge=1, le=200),
+) -> list[TournamentOut]:
+    return await tournaments.list_tournaments(limit)
+
+
+@tournaments_router.get(
+    "/tournament/{tournament_id}", response_model=TournamentDetailOut
+)
+async def get_tournament(tournament_id: UUID) -> TournamentDetailOut:
+    """Tournament detail: participants, computed standings, and its games."""
+    return await tournaments.tournament_detail(tournament_id)
+
+
+@tournaments_router.post("/tournament/{tournament_id}/cancel")
+async def cancel_tournament(
+    tournament_id: UUID, user: User = Depends(auth.require_user)
+) -> dict[str, bool]:
+    """Stop a running tournament (creator or admin only)."""
+    await tournaments.cancel_tournament(user, tournament_id)
+    return {"success": True}
+
+
 # --- live streaming -----------------------------------------------------------
 
 streaming_router = APIRouter(tags=["Live streaming"])
@@ -247,4 +288,5 @@ async def sse_runner_stream() -> AsyncIterable[RunnerLiveEvent]:
 router.include_router(auth_router)
 router.include_router(engines_router)
 router.include_router(games_router)
+router.include_router(tournaments_router)
 router.include_router(streaming_router)

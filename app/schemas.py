@@ -3,6 +3,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict
 
+from app.models import TournamentFormat, TournamentStatus
 from machineplay.schemas import GameStatus, GameStreamEvent, HardwareInfo, Telemetry
 
 
@@ -194,3 +195,73 @@ class UserProfileOut(BaseModel):
     created_at: datetime
     engines: list[EngineOut]
     games: list[GameOut]
+
+
+class TournamentCreateRequest(BaseModel):
+    name: str
+    format: TournamentFormat
+    # Participants by engine id; each engine's latest version is snapshotted at
+    # creation. Must be distinct; between 2 and the participant cap.
+    engine_ids: list[UUID]
+    # Required for GAUNTLET (must be one of engine_ids); ignored for round robin.
+    gauntlet_head_id: UUID | None = None
+    # Games each pairing plays (colors alternate). Odd values allowed.
+    games_per_pairing: int = 2
+    # The runner every game plays on (must be online).
+    runner_id: UUID
+    # Time control "base+inc"; defaults to the server-wide setting.
+    tc: str | None = None
+
+
+class TournamentParticipantOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    engine_id: UUID
+    engine_name: str
+    version_id: UUID
+    version: str
+
+
+class StandingRow(BaseModel):
+    """One participant's tally over the tournament's finished (ENDED) games."""
+
+    engine_id: UUID
+    engine_name: str
+    played: int
+    wins: int
+    draws: int
+    losses: int
+    score: float
+
+
+class TournamentOut(BaseModel):
+    """List-view summary: metadata plus game-progress counts."""
+
+    id: UUID
+    name: str
+    format: TournamentFormat
+    status: TournamentStatus
+    runner_id: UUID
+    created_by: str
+    participant_count: int
+    games_total: int
+    games_completed: int
+    created_at: datetime
+    ended_at: datetime | None = None
+
+
+class TournamentDetailOut(BaseModel):
+    id: UUID
+    name: str
+    format: TournamentFormat
+    status: TournamentStatus
+    runner_id: UUID
+    created_by: str
+    tc: str
+    games_per_pairing: int
+    gauntlet_head_id: UUID | None
+    participants: list[TournamentParticipantOut]
+    standings: list[StandingRow]
+    games: list[GameOut]
+    created_at: datetime
+    ended_at: datetime | None = None

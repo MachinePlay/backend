@@ -9,6 +9,7 @@ runner id. "Online" means present in the ``_online`` map.
 
 import asyncio
 import logging
+from collections.abc import Awaitable, Callable
 from uuid import UUID
 
 from machineplay import schemas
@@ -100,6 +101,30 @@ def get_online(runner_id: UUID) -> RunnerConnection:
         raise NotFoundError(
             "runner is not online", details={"runner_id": str(runner_id)}
         )
+
+
+def find_online(runner_id: UUID) -> RunnerConnection | None:
+    """The live connection for `runner_id`, or None when it's offline."""
+    return _online.get(runner_id)
+
+
+# Called with a runner id right after it comes online. The hook point for
+# schedulers that resume work pinned to a runner (a tournament picking its
+# pending pairings back up once its runner reconnects).
+RunnerConnectedHook = Callable[[UUID], Awaitable[None]]
+_connected_hooks: list[RunnerConnectedHook] = []
+
+
+def on_runner_connected(hook: RunnerConnectedHook) -> None:
+    _connected_hooks.append(hook)
+
+
+async def notify_connected(runner_id: UUID) -> None:
+    for hook in _connected_hooks:
+        try:
+            await hook(runner_id)
+        except Exception:
+            logger.exception("runner-connected hook failed for runner=%s", runner_id)
 
 
 def is_current(conn: RunnerConnection) -> bool:

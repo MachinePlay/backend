@@ -197,13 +197,21 @@ class UserProfileOut(BaseModel):
     games: list[GameOut]
 
 
+class TournamentEntry(BaseModel):
+    engine_id: UUID
+    # Specific uploaded version to enter; defaults to the engine's latest. The
+    # chosen version is snapshotted onto the tournament at creation.
+    version_id: UUID | None = None
+
+
 class TournamentCreateRequest(BaseModel):
     name: str
     format: TournamentFormat
-    # Participants by engine id; each engine's latest version is snapshotted at
-    # creation. Must be distinct; between 2 and the participant cap.
-    engine_ids: list[UUID]
-    # Required for GAUNTLET (must be one of engine_ids); ignored for round robin.
+    # Participants (engine + optional version). Engines must be distinct;
+    # between 2 and the participant cap.
+    entries: list[TournamentEntry]
+    # Required for GAUNTLET (must be one of the entries' engine_id); ignored for
+    # round robin.
     gauntlet_head_id: UUID | None = None
     # Games each pairing plays (colors alternate). Odd values allowed.
     games_per_pairing: int = 2

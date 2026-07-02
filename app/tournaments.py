@@ -108,7 +108,7 @@ async def create_tournament(user: User, payload: TournamentCreateRequest) -> Tou
             f"games_per_pairing must be between 1 and {MAX_GAMES_PER_PAIRING}"
         )
 
-    ids = payload.engine_ids
+    ids = [entry.engine_id for entry in payload.entries]
     if len(set(ids)) != len(ids):
         raise ConflictError("participants must be distinct engines")
     if len(ids) < 2:
@@ -126,22 +126,20 @@ async def create_tournament(user: User, payload: TournamentCreateRequest) -> Tou
     runner = runners.get_online(payload.runner_id)
     tc = payload.tc or settings.tc
 
-    # Resolve engines and snapshot each one's latest uploaded version.
+    # Resolve engines and snapshot the chosen version (or each engine's latest).
     engine_by_id: dict[UUID, Engine] = {}
     version_by_id: dict[UUID, EngineVersion] = {}
     participants: list[TournamentParticipant] = []
-    for eid in ids:
-        engine = await Engine.get(eid)
+    for entry in payload.entries:
+        engine = await Engine.get(entry.engine_id)
         if engine is None:
-            raise NotFoundError(f"engine {eid} not found")
-        version = await games._latest_version(engine.id)
-        if version is None:
-            raise ConflictError(f"engine {engine.name!r} has no uploaded image to play")
-        engine_by_id[eid] = engine
-        version_by_id[eid] = version
+            raise NotFoundError(f"engine {entry.engine_id} not found")
+        version = await games._resolve_version(engine, entry.version_id)
+        engine_by_id[entry.engine_id] = engine
+        version_by_id[entry.engine_id] = version
         participants.append(
             TournamentParticipant(
-                engine_id=eid,
+                engine_id=entry.engine_id,
                 engine_name=engine.name,
                 version_id=version.id,
                 version=version.version,

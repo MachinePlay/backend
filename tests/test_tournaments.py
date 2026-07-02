@@ -15,7 +15,7 @@ from app.models import (
     TournamentStatus,
     User,
 )
-from app.schemas import TournamentCreateRequest
+from app.schemas import TournamentCreateRequest, TournamentEntry
 
 
 # --- pairing generators (pure) -----------------------------------------------
@@ -63,6 +63,10 @@ async def _engine(user: User, name: str) -> Engine:
     return engine
 
 
+def _entries(*engines: Engine) -> list[TournamentEntry]:
+    return [TournamentEntry(engine_id=e.id) for e in engines]
+
+
 async def _online_runner(user: User, max_games: int) -> runners.RunnerConnection:
     doc = await Runner(
         id=uuid4(),
@@ -93,7 +97,7 @@ async def test_create_round_robin_dispatches_up_to_capacity() -> None:
             TournamentCreateRequest(
                 name="cup",
                 format=TournamentFormat.ROUND_ROBIN,
-                engine_ids=[e.id for e in engines],
+                entries=_entries(*engines),
                 games_per_pairing=2,
                 runner_id=conn.runner_id,
                 tc="10+0.1",
@@ -126,7 +130,7 @@ async def test_create_rejects_offline_runner() -> None:
             TournamentCreateRequest(
                 name="cup",
                 format=TournamentFormat.ROUND_ROBIN,
-                engine_ids=[e.id for e in engines],
+                entries=_entries(*engines),
                 runner_id=uuid4(),
             ),
         )
@@ -147,11 +151,51 @@ async def test_gauntlet_requires_head_among_participants() -> None:
                 TournamentCreateRequest(
                     name="g",
                     format=TournamentFormat.GAUNTLET,
-                    engine_ids=[e.id for e in engines],
+                    entries=_entries(*engines),
                     gauntlet_head_id=uuid4(),  # not a participant
                     runner_id=conn.runner_id,
                 ),
             )
+    finally:
+        _cleanup(conn)
+
+
+async def test_create_snapshots_chosen_version() -> None:
+    user = await User(github_id=10, login="jade").insert()
+    e1 = await _engine(user, "a")  # created with version "v1"
+    e2 = await _engine(user, "b")
+    v1 = await EngineVersion.find_one({"engine.$id": e1.id})
+    assert v1 is not None
+    # A newer version exists, but we deliberately enter the older v1.
+    await EngineVersion(
+        engine=e1,
+        version="v2",
+        image_repository="jade/a",
+        image_digest="sha256:a2",
+    ).insert()
+    conn = await _online_runner(user, max_games=2)
+    try:
+        tour = await tournaments.create_tournament(
+            user,
+            TournamentCreateRequest(
+                name="pinned",
+                format=TournamentFormat.ROUND_ROBIN,
+                entries=[
+                    TournamentEntry(engine_id=e1.id, version_id=v1.id),
+                    TournamentEntry(engine_id=e2.id),
+                ],
+                games_per_pairing=1,
+                runner_id=conn.runner_id,
+            ),
+        )
+        part = next(p for p in tour.participants if p.engine_id == e1.id)
+        assert part.version_id == v1.id
+        assert part.version == "v1"
+        # The game pins the chosen v1, not the latest v2.
+        g = await Game.find_one(Game.tournament_id == tour.id)
+        assert g is not None
+        vid = g.white_version_id if g.white_id == e1.id else g.black_version_id
+        assert vid == v1.id
     finally:
         _cleanup(conn)
 
@@ -170,7 +214,7 @@ async def test_finishing_a_game_dispatches_the_next_and_completes() -> None:
             TournamentCreateRequest(
                 name="duel",
                 format=TournamentFormat.ROUND_ROBIN,
-                engine_ids=[e1.id, e2.id],
+                entries=_entries(e1, e2),
                 games_per_pairing=2,
                 runner_id=conn.runner_id,
             ),
@@ -224,7 +268,7 @@ async def test_disconnect_pauses_and_reconnect_resumes() -> None:
             TournamentCreateRequest(
                 name="flaky",
                 format=TournamentFormat.ROUND_ROBIN,
-                engine_ids=[e1.id, e2.id],
+                entries=_entries(e1, e2),
                 games_per_pairing=1,
                 runner_id=runner_id,
             ),
@@ -279,7 +323,7 @@ async def test_standings_score_and_order() -> None:
             TournamentCreateRequest(
                 name="score",
                 format=TournamentFormat.ROUND_ROBIN,
-                engine_ids=[e1.id, e2.id],
+                entries=_entries(e1, e2),
                 games_per_pairing=2,
                 runner_id=conn.runner_id,
             ),
@@ -324,7 +368,7 @@ async def test_cancel_aborts_live_and_pending_games() -> None:
             TournamentCreateRequest(
                 name="stop",
                 format=TournamentFormat.ROUND_ROBIN,
-                engine_ids=[e1.id, e2.id],
+                entries=_entries(e1, e2),
                 games_per_pairing=2,
                 runner_id=conn.runner_id,
             ),
@@ -365,7 +409,7 @@ async def test_cancel_forbidden_for_non_creator() -> None:
             TournamentCreateRequest(
                 name="mine",
                 format=TournamentFormat.ROUND_ROBIN,
-                engine_ids=[e1.id, e2.id],
+                entries=_entries(e1, e2),
                 games_per_pairing=1,
                 runner_id=conn.runner_id,
             ),

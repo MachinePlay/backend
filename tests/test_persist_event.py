@@ -77,6 +77,23 @@ async def test_game_end_event_sets_status_and_pgn() -> None:
     assert refreshed.ended_at is not None
 
 
+async def test_aborted_game_end_event_sets_status_and_reason() -> None:
+    g = await _make_game()
+
+    await persist_event(
+        g.id,
+        schemas.GameEndEvent(
+            result="*", status=GameStatus.ABORTED, reason="wallclock timeout"
+        ),
+    )
+
+    refreshed = await Game.get(g.id)
+    assert refreshed is not None
+    assert refreshed.status == GameStatus.ABORTED
+    assert refreshed.result == "*"
+    assert refreshed.reason == "wallclock timeout"
+
+
 async def test_unknown_game_id_is_a_noop(caplog: pytest.LogCaptureFixture) -> None:
     missing_id = uuid4()
     with caplog.at_level("WARNING"):

@@ -57,11 +57,9 @@ async def list_engines() -> list[EngineOut]:
 
 
 async def by_name(owner: User, name: str) -> Engine:
-    """Case-insensitive engine lookup within an owner's namespace."""
-    engine = await Engine.find_one(
-        {"owner.$id": owner.id},
-        {"name": {"$regex": f"^{re.escape(name)}$", "$options": "i"}},
-    )
+    """Case-insensitive engine lookup within an owner's namespace: names are
+    stored lowercase (validated at registration), so lowercase and match."""
+    engine = await Engine.find_one({"owner.$id": owner.id}, Engine.name == name.lower())
     if engine is None:
         raise NotFoundError("engine not found")
     return engine

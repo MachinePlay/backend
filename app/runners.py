@@ -42,6 +42,9 @@ class RunnerConnection:
     def is_full(self) -> bool:
         return len(self._game_ids) >= self.max_games
 
+    def is_playing(self, game_id: UUID) -> bool:
+        return game_id in self._game_ids
+
     def track_game(self, game_id: UUID) -> None:
         self._game_ids.add(game_id)
 
@@ -80,8 +83,14 @@ def mark_online(runner_id: UUID, max_games: int) -> RunnerConnection:
     return conn
 
 
-def mark_offline(runner_id: UUID) -> RunnerConnection | None:
-    return _online.pop(runner_id, None)
+def mark_offline(conn: RunnerConnection) -> bool:
+    """Take `conn` offline. Returns False when the runner reconnected and a
+    newer connection already replaced this one — a stale session's cleanup must
+    not knock the live connection offline."""
+    if _online.get(conn.runner_id) is conn:
+        del _online[conn.runner_id]
+        return True
+    return False
 
 
 def get_online(runner_id: UUID) -> RunnerConnection:
@@ -91,6 +100,25 @@ def get_online(runner_id: UUID) -> RunnerConnection:
         raise NotFoundError(
             "runner is not online", details={"runner_id": str(runner_id)}
         )
+
+
+def is_current(conn: RunnerConnection) -> bool:
+    """Whether `conn` is still the live connection for its runner id."""
+    return _online.get(conn.runner_id) is conn
+
+
+def find_by_game(game_id: UUID) -> RunnerConnection | None:
+    """The online runner currently playing `game_id`, if any."""
+    for conn in _online.values():
+        if conn.is_playing(game_id):
+            return conn
+    return None
+
+
+def untrack_game(game_id: UUID) -> None:
+    """Drop `game_id` from whichever online runner tracks it (frees the slot)."""
+    for conn in _online.values():
+        conn.untrack_game(game_id)
 
 
 async def upsert_on_connect(

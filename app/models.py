@@ -98,11 +98,22 @@ class Game(UUIDDocument):
     black: Link[Engine]
     white_name: str
     black_name: str
-    # Which uploaded version each side played.
+    # Which uploaded version each side played: the display string plus the
+    # EngineVersion id it was resolved to (pins the exact image for reruns/ELO).
     white_version: str
     black_version: str
+    white_version_id: UUID | None = None
+    black_version_id: UUID | None = None
+    # The runner this game was scheduled on and the time control it played.
+    runner_id: UUID | None = None
+    tc: str | None = None
+    # Set when the game belongs to a tournament (M8).
+    tournament_id: UUID | None = None
     status: GameStatus = GameStatus.PLAYING
     result: str | None = None
+    # How the game terminated ("time forfeit", "cancelled", "runner
+    # disconnected", …); None for a plain finish.
+    reason: str | None = None
     moves: list[str] = Field(default_factory=list)
     fen: str = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
     pgn: str | None = None
@@ -123,4 +134,11 @@ class Game(UUIDDocument):
         return cast(UUID, self.black.ref.id)
 
     class Settings:
-        indexes = ["created_at"]
+        # white/black indexes back the "games of these engines" queries on
+        # profile and engine pages; tournament_id backs tournament pages (M8).
+        indexes = [
+            "created_at",
+            IndexModel([("white.$id", ASCENDING)]),
+            IndexModel([("black.$id", ASCENDING)]),
+            "tournament_id",
+        ]

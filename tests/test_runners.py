@@ -8,7 +8,7 @@ from machineplay.schemas import HardwareInfo
 from app import runners, streaming
 from app.auth import mint_token
 from app.main import app
-from app.models import Runner, User
+from app.models import Engine, Game, Runner, User
 from app.schemas import RunnerUpdateRequest
 
 _HW = HardwareInfo(
@@ -38,7 +38,7 @@ async def test_list_runners_online_status() -> None:
     assert row["active_games"] == 0
 
     # A live connection flips it online.
-    runners.mark_online(doc.id, max_games=4)
+    conn = runners.mark_online(doc.id, max_games=4)
     try:
         async with _client() as client:
             resp = await client.get("/runners")
@@ -46,7 +46,23 @@ async def test_list_runners_online_status() -> None:
         assert row["online"] is True
         assert row["max_games"] == 4
     finally:
-        runners.mark_offline(doc.id)
+        runners.mark_offline(conn)
+
+
+async def test_stale_connection_cleanup_keeps_reconnected_runner_online() -> None:
+    """A runner that reconnects before its old session's cleanup runs must stay
+    online: the stale session's mark_offline must not pop the new connection."""
+    runner_id = uuid4()
+    old = runners.mark_online(runner_id, max_games=4)
+    new = runners.mark_online(runner_id, max_games=4)  # reconnect supersedes
+
+    assert runners.mark_offline(old) is False  # stale cleanup is a no-op
+    assert runners.get_online(runner_id) is new
+    assert runners.is_current(new)
+    assert not runners.is_current(old)
+
+    assert runners.mark_offline(new) is True
+    assert not runners.is_current(new)
 
 
 async def test_get_runner_detail() -> None:
@@ -227,3 +243,75 @@ async def test_runner_ws_persists_hardware_and_streams_telemetry() -> None:
 
     # Runner went offline, so it no longer appears in the live snapshot.
     assert runner_id not in {e.runner_id for e in runners.live_snapshot()}
+
+
+async def _playing_game(owner: User) -> Game:
+    engine = await Engine(name="e", owner=owner, owner_login=owner.login).insert()
+    return await Game(
+        white=engine,
+        black=engine,
+        white_name="e",
+        black_name="e",
+        white_version="v1",
+        black_version="v1",
+    ).insert()
+
+
+async def test_runner_ws_ignores_events_for_foreign_games() -> None:
+    """A runner must not be able to write games it wasn't scheduled to play."""
+    owner = await User(github_id=31, login="ivan").insert()
+    token = await mint_token(owner)
+    game = await _playing_game(owner)
+    # The game is live, but scheduled on some *other* runner.
+    streaming.game_registry.register_game(game.id)
+
+    intro = ws_schemas.Introduction(
+        runner_id=uuid4(), name="ivan-box", max_games=4, hardware=_HW
+    )
+    foreign_end = ws_schemas.GameEvent(
+        game_id=game.id,
+        event=ws_schemas.GameEndEvent(result="1-0", pgn="fake"),
+    )
+    ws = _FakeWS(
+        [intro.model_dump_json(), foreign_end.model_dump_json()], f"Bearer {token}"
+    )
+    try:
+        await streaming.runner_session(ws)  # type: ignore[arg-type]
+
+        refreshed = await Game.get(game.id)
+        assert refreshed is not None
+        assert refreshed.status == ws_schemas.GameStatus.PLAYING
+        assert refreshed.pgn is None
+    finally:
+        streaming.game_registry.unregister(game.id)
+
+
+async def test_finish_game_persists_frees_slot_and_notifies_hooks() -> None:
+    owner = await User(github_id=32, login="judy").insert()
+    game = await _playing_game(owner)
+    conn = runners.mark_online(uuid4(), max_games=2)
+    conn.track_game(game.id)
+    streaming.game_registry.register_game(game.id)
+
+    seen: list[tuple[object, str | None]] = []
+
+    async def hook(game_id: object, event: ws_schemas.GameEndEvent) -> None:
+        seen.append((game_id, event.reason))
+
+    streaming.on_game_finished(hook)
+    try:
+        await streaming.finish_game(
+            game.id,
+            ws_schemas.GameEndEvent(result="0-1", pgn="1. e4 0-1", reason="checkmate"),
+        )
+    finally:
+        streaming._game_finished_hooks.remove(hook)
+        runners.mark_offline(conn)
+
+    refreshed = await Game.get(game.id)
+    assert refreshed is not None
+    assert refreshed.status == ws_schemas.GameStatus.ENDED
+    assert refreshed.result == "0-1"
+    assert refreshed.reason == "checkmate"
+    assert conn.active_games == 0  # slot freed
+    assert seen == [(game.id, "checkmate")]

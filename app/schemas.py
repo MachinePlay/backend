@@ -13,11 +13,13 @@ class StartGameRequest(BaseModel):
     # Specific uploaded versions to play; defaults to each engine's latest.
     white_version_id: UUID | None = None
     black_version_id: UUID | None = None
+    # Time control "base+inc" in seconds (e.g. "30+0.3"); defaults to the
+    # server-wide setting.
+    tc: str | None = None
 
 
 class StartGameResponse(BaseModel):
     id: UUID
-    status: str
     white: UUID
     black: UUID
 
@@ -170,11 +172,15 @@ class GameOut(BaseModel):
     black_version: str
     status: GameStatus
     result: str | None
+    reason: str | None = None
     moves: list[str]
     fen: str
     pgn: str | None
     white_clock: float
     black_clock: float
+    tc: str | None = None
+    runner_id: UUID | None = None
+    tournament_id: UUID | None = None
     created_at: datetime
     ended_at: datetime | None
 

@@ -1,7 +1,5 @@
 """Public user profiles and case-insensitive login lookup."""
 
-import re
-
 from app import engines, games
 from app.exceptions import NotFoundError
 from app.models import Engine, User
@@ -9,10 +7,9 @@ from app.schemas import GameOut, UserProfileOut
 
 
 async def find_by_login(login: str) -> User | None:
-    """Case-insensitive lookup so e.g. 'saegl' can't shadow 'Saegl'."""
-    return await User.find_one(
-        {"login": {"$regex": f"^{re.escape(login)}$", "$options": "i"}}
-    )
+    """Case-insensitive lookup: handles are stored lowercase (validated at
+    registration), so lowercasing the input gives an exact, indexable match."""
+    return await User.find_one(User.login == login.lower())
 
 
 async def by_login(login: str) -> User:

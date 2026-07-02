@@ -1,6 +1,6 @@
 import asyncio
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from uuid import UUID
 
 from fastapi import WebSocket, WebSocketDisconnect
@@ -32,21 +32,51 @@ def _snapshot_event(doc: GameDoc) -> schemas.FenEvent:
     )
 
 
-async def abort_game(game_id: UUID) -> None:
-    """Mark a playing game as aborted in DB and notify subscribers."""
-    doc = await GameDoc.get(game_id)
-    if doc is not None and doc.status == GameStatus.PLAYING:
-        doc.status = GameStatus.ABORTED
-        doc.result = "*"
-        doc.ended_at = utcnow()
-        await doc.save()
-        logger.info("aborted game=%s", game_id)
+# Called with (game_id, end event) after a game reaches a terminal state and
+# is persisted. This is the hook point for schedulers that react to finished
+# games (e.g. a tournament advancing to its next pairing).
+GameFinishedHook = Callable[[UUID, schemas.GameEndEvent], Awaitable[None]]
+_game_finished_hooks: list[GameFinishedHook] = []
 
+
+def on_game_finished(hook: GameFinishedHook) -> None:
+    _game_finished_hooks.append(hook)
+
+
+async def finish_game(game_id: UUID, event: schemas.GameEndEvent) -> None:
+    """Single terminal path for a game: free its runner slot, persist the end
+    state, drop the live stream, fan out to subscribers, and notify hooks.
+
+    Used both for runner-reported ends and server-side aborts.
+    """
+    runners.untrack_game(game_id)
     game = game_registry.unregister(game_id)
+    await persist_event(game_id, event)
     if game is not None:
-        end_event = schemas.GameEndEvent(result="*", pgn=None)
-        await game.broadcast(end_event)
-        await live_stream.broadcast(game_id, end_event)
+        await game.broadcast(event)
+    await live_stream.broadcast(game_id, event)
+    for hook in _game_finished_hooks:
+        try:
+            await hook(game_id, event)
+        except Exception:
+            logger.exception("game-finished hook failed for game=%s", game_id)
+
+
+async def abort_game(game_id: UUID, reason: str = "aborted") -> None:
+    """Mark a playing game as aborted in DB and notify subscribers. Games that
+    already reached a terminal state are left untouched (idempotent)."""
+    doc = await GameDoc.get(game_id)
+    if doc is None or doc.status != GameStatus.PLAYING:
+        game_registry.unregister(game_id)
+        runners.untrack_game(game_id)
+        return
+    logger.info("aborting game=%s (%s)", game_id, reason)
+    await finish_game(
+        game_id,
+        schemas.GameEndEvent(
+            result="*", pgn=None, status=GameStatus.ABORTED, reason=reason
+        ),
+    )
 
 
 async def abort_orphan_games() -> None:
@@ -55,6 +85,7 @@ async def abort_orphan_games() -> None:
     for doc in orphans:
         doc.status = GameStatus.ABORTED
         doc.result = "*"
+        doc.reason = "backend restarted"
         doc.ended_at = utcnow()
         await doc.save()
     if orphans:
@@ -76,10 +107,11 @@ async def persist_event(game_id: UUID, event: schemas.GameStreamEvent) -> None:
         case schemas.MoveEvent(san=san, fen=fen, white_clock=wc, black_clock=bc):
             update["$push"] = {"moves": san}
             update["$set"] = {"fen": fen, "white_clock": wc, "black_clock": bc}
-        case schemas.GameEndEvent(result=result, pgn=pgn):
+        case schemas.GameEndEvent(result=result, pgn=pgn, status=status, reason=reason):
             set_fields: dict[str, object] = {
-                "status": GameStatus.ENDED,
+                "status": status,
                 "result": result,
+                "reason": reason,
                 "ended_at": utcnow(),
             }
             if pgn is not None:
@@ -283,14 +315,23 @@ async def runner_session(ws: WebSocket) -> None:
             cmd: schemas.ClientCommandType = schemas.client_adapter.validate_json(data)
             match cmd:
                 case schemas.GameEvent(game_id=game_id, event=event):
+                    # Only accept events for games scheduled on this runner —
+                    # one runner must not be able to write another's games.
+                    if not runner.is_playing(game_id):
+                        logger.warning(
+                            "runner=%s sent event for game=%s it doesn't play",
+                            runner.runner_id,
+                            game_id,
+                        )
+                        continue
+                    if isinstance(event, schemas.GameEndEvent):
+                        await finish_game(game_id, event)
+                        continue
                     try:
                         game = game_registry.get_game(game_id)
                     except NotFoundError:
                         logger.warning("event for unregistered game_id=%s", game_id)
                         continue
-                    if isinstance(event, schemas.GameEndEvent):
-                        runner.untrack_game(game_id)
-                        game_registry.unregister(game_id)
                     await persist_event(game_id, event)
                     await game.broadcast(event)
                     await live_stream.broadcast(game_id, event)
@@ -321,19 +362,23 @@ async def runner_session(ws: WebSocket) -> None:
         recv_task.cancel()
         send_task.cancel()
         # Take the runner offline first so nothing new gets scheduled onto it,
-        # then abort whatever it was mid-game on. The durable doc stays; only the
-        # live connection goes away.
-        runners.mark_offline(intro.runner_id)
-        runner_stream.broadcast(
-            RunnerLiveEvent(
-                runner_id=intro.runner_id,
-                online=False,
-                active_games=0,
-                telemetry=None,
+        # then abort whatever it was mid-game on. The durable doc stays; only
+        # the live connection goes away. If the runner already reconnected
+        # (mark_offline returns False because a newer connection replaced this
+        # one), the runner is still online — don't broadcast it offline.
+        went_offline = runners.mark_offline(runner)
+        if went_offline:
+            runner_stream.broadcast(
+                RunnerLiveEvent(
+                    runner_id=intro.runner_id,
+                    online=False,
+                    active_games=0,
+                    telemetry=None,
+                )
             )
-        )
+        # This session's games died with its runner process either way.
         for game_id in runner.game_ids():
-            await abort_game(game_id)
+            await abort_game(game_id, reason="runner disconnected")
         await runners.touch_last_seen(intro.runner_id)
 
 

@@ -181,6 +181,15 @@ async def start_game(
     return await games.start_game(user, payload)
 
 
+@games_router.post("/game/{game_id}/cancel")
+async def cancel_game(
+    game_id: UUID, user: User = Depends(auth.require_user)
+) -> dict[str, bool]:
+    """Stop a running game: aborts it and kills its engine containers."""
+    await games.cancel_game(user, game_id)
+    return {"success": True}
+
+
 @games_router.get("/game", response_model=list[GameOut])
 async def list_games(limit: int = Query(default=50, ge=1, le=200)) -> list[Game]:
     return await games.list_games(limit)

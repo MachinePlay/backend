@@ -63,8 +63,9 @@ async def test_register_creates_user_and_logs_in() -> None:
 
 
 async def test_register_rejects_invalid_and_taken_handles() -> None:
+    # Handles are stored lowercase (legacy uppercase docs are migrated by
+    # scripts/lowercase_handles.py); requests are lowercased before matching.
     await User(github_id=1, login="taken").insert()
-    await User(github_id=2, login="Cased").insert()
 
     for bad in ["", "-foo", "foo-", "fo--o", "Foo!", "a" * 33, "machineplay"]:
         async with _client() as client:
@@ -72,7 +73,7 @@ async def test_register_rejects_invalid_and_taken_handles() -> None:
             resp = await client.post("/auth/register", json={"login": bad})
         assert resp.status_code == 409, bad
 
-    for taken in ["taken", "cased"]:  # case-insensitive collision
+    for taken in ["taken", "Taken", "TAKEN"]:  # case-insensitive collision
         async with _client() as client:
             client.cookies.set("session", _session_cookie(PENDING))
             resp = await client.post("/auth/register", json={"login": taken})

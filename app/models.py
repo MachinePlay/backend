@@ -185,8 +185,9 @@ class Tournament(UUIDDocument):
     # Games each pairing plays; colors alternate across them. Odd values are
     # allowed (an intentionally color-lopsided tournament).
     games_per_pairing: int
-    # The engine that plays everyone else (GAUNTLET only; None for round robin).
-    gauntlet_head_id: UUID | None = None
+    # The participant that plays everyone else, identified by its version id (the
+    # per-participant key). GAUNTLET only; None for round robin.
+    gauntlet_head_version_id: UUID | None = None
     participants: list[TournamentParticipant] = Field(default_factory=list)
     status: TournamentStatus = TournamentStatus.RUNNING
     created_at: datetime = Field(default_factory=utcnow)

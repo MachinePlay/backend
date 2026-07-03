@@ -108,38 +108,46 @@ async def create_tournament(user: User, payload: TournamentCreateRequest) -> Tou
             f"games_per_pairing must be between 1 and {MAX_GAMES_PER_PAIRING}"
         )
 
-    ids = [entry.engine_id for entry in payload.entries]
-    if len(set(ids)) != len(ids):
-        raise ConflictError("participants must be distinct engines")
-    if len(ids) < 2:
-        raise ConflictError("a tournament needs at least 2 engines")
-    if len(ids) > MAX_PARTICIPANTS:
-        raise ConflictError(f"at most {MAX_PARTICIPANTS} engines per tournament")
+    n = len(payload.entries)
+    if n < 2:
+        raise ConflictError("a tournament needs at least 2 participants")
+    if n > MAX_PARTICIPANTS:
+        raise ConflictError(f"at most {MAX_PARTICIPANTS} participants per tournament")
 
-    head_id: UUID | None = None
+    head: int | None = None
     if payload.format == TournamentFormat.GAUNTLET:
-        head_id = payload.gauntlet_head_id
-        if head_id is None or head_id not in ids:
-            raise ConflictError("a gauntlet needs a head engine among the participants")
+        head = payload.gauntlet_head_index
+        if head is None or not 0 <= head < n:
+            raise ConflictError("a gauntlet needs a head chosen among the participants")
 
     # The runner must be online now; games dispatch onto it immediately.
     runner = runners.get_online(payload.runner_id)
     tc = payload.tc or settings.tc
 
-    # Resolve engines and snapshot the chosen version (or each engine's latest).
-    engine_by_id: dict[UUID, Engine] = {}
-    version_by_id: dict[UUID, EngineVersion] = {}
+    # Resolve each entry's engine + chosen version (or its latest). A participant
+    # is a distinct (engine, version) pair, so the same engine may enter at two
+    # different versions — but the exact same pair twice is a duplicate. Keep the
+    # resolved engines/versions positional (aligned with participants) so the
+    # pairing indices address them even when an engine repeats.
+    engines_ordered: list[Engine] = []
+    versions_ordered: list[EngineVersion] = []
     participants: list[TournamentParticipant] = []
+    seen: set[tuple[UUID, UUID]] = set()
     for entry in payload.entries:
         engine = await Engine.get(entry.engine_id)
         if engine is None:
             raise NotFoundError(f"engine {entry.engine_id} not found")
         version = await games._resolve_version(engine, entry.version_id)
-        engine_by_id[entry.engine_id] = engine
-        version_by_id[entry.engine_id] = version
+        if (engine.id, version.id) in seen:
+            raise ConflictError(
+                f"{engine.name!r} {version.version!r} is entered more than once"
+            )
+        seen.add((engine.id, version.id))
+        engines_ordered.append(engine)
+        versions_ordered.append(version)
         participants.append(
             TournamentParticipant(
-                engine_id=entry.engine_id,
+                engine_id=engine.id,
                 engine_name=engine.name,
                 version_id=version.id,
                 version=version.version,
@@ -147,10 +155,10 @@ async def create_tournament(user: User, payload: TournamentCreateRequest) -> Tou
         )
 
     if payload.format == TournamentFormat.GAUNTLET:
-        assert head_id is not None
-        order = gauntlet_order(len(ids), ids.index(head_id), payload.games_per_pairing)
+        assert head is not None
+        order = gauntlet_order(n, head, payload.games_per_pairing)
     else:
-        order = round_robin_order(len(ids), payload.games_per_pairing)
+        order = round_robin_order(n, payload.games_per_pairing)
 
     tour = Tournament(
         name=name,
@@ -160,18 +168,21 @@ async def create_tournament(user: User, payload: TournamentCreateRequest) -> Tou
         tc=tc,
         format=payload.format,
         games_per_pairing=payload.games_per_pairing,
-        gauntlet_head_id=head_id,
+        # The head participant's version id is the stable per-participant key
+        # used to highlight it in standings.
+        gauntlet_head_version_id=(
+            participants[head].version_id if head is not None else None
+        ),
         participants=participants,
     )
     await tour.insert()
 
     for white_i, black_i in order:
-        w, b = ids[white_i], ids[black_i]
         await games.create_game(
-            engine_by_id[w],
-            engine_by_id[b],
-            version_by_id[w],
-            version_by_id[b],
+            engines_ordered[white_i],
+            engines_ordered[black_i],
+            versions_ordered[white_i],
+            versions_ordered[black_i],
             tc=tc,
             runner_id=runner.runner_id,
             tournament_id=tour.id,
@@ -181,7 +192,7 @@ async def create_tournament(user: User, payload: TournamentCreateRequest) -> Tou
         "created tournament=%s %s %d players %d games by %s on runner=%s",
         tour.id,
         payload.format,
-        len(ids),
+        n,
         len(order),
         user.login,
         runner.runner_id,
@@ -356,17 +367,21 @@ async def get_tournament(tournament_id: UUID) -> Tournament:
 
 
 def compute_standings(tour: Tournament, tourney_games: list[Game]) -> list[StandingRow]:
-    """W=1 / D=0.5 / L=0 over ENDED games, sorted by score then wins then name."""
-    wins: dict[UUID, int] = {p.engine_id: 0 for p in tour.participants}
-    draws: dict[UUID, int] = {p.engine_id: 0 for p in tour.participants}
-    losses: dict[UUID, int] = {p.engine_id: 0 for p in tour.participants}
-    names = {p.engine_id: p.engine_name for p in tour.participants}
+    """W=1 / D=0.5 / L=0 over ENDED games, sorted by score then wins then name.
+
+    Keyed by version id: a participant is an (engine, version) pair, so two
+    versions of the same engine keep separate rows.
+    """
+    parts = {p.version_id: p for p in tour.participants}
+    wins: dict[UUID, int] = {vid: 0 for vid in parts}
+    draws: dict[UUID, int] = {vid: 0 for vid in parts}
+    losses: dict[UUID, int] = {vid: 0 for vid in parts}
 
     for g in tourney_games:
         if g.status != GameStatus.ENDED:
             continue
-        w, b = g.white_id, g.black_id
-        if w not in names or b not in names:
+        w, b = g.white_version_id, g.black_version_id
+        if w not in parts or b not in parts:
             continue
         if g.result == "1-0":
             wins[w] += 1
@@ -380,17 +395,19 @@ def compute_standings(tour: Tournament, tourney_games: list[Game]) -> list[Stand
 
     rows = [
         StandingRow(
-            engine_id=eid,
-            engine_name=names[eid],
-            played=wins[eid] + draws[eid] + losses[eid],
-            wins=wins[eid],
-            draws=draws[eid],
-            losses=losses[eid],
-            score=wins[eid] + 0.5 * draws[eid],
+            engine_id=p.engine_id,
+            engine_name=p.engine_name,
+            version_id=vid,
+            version=p.version,
+            played=wins[vid] + draws[vid] + losses[vid],
+            wins=wins[vid],
+            draws=draws[vid],
+            losses=losses[vid],
+            score=wins[vid] + 0.5 * draws[vid],
         )
-        for eid in names
+        for vid, p in parts.items()
     ]
-    rows.sort(key=lambda r: (-r.score, -r.wins, r.engine_name))
+    rows.sort(key=lambda r: (-r.score, -r.wins, r.engine_name, r.version))
     return rows
 
 
@@ -408,7 +425,7 @@ async def tournament_detail(tournament_id: UUID) -> TournamentDetailOut:
         created_by=tour.created_by,
         tc=tour.tc,
         games_per_pairing=tour.games_per_pairing,
-        gauntlet_head_id=tour.gauntlet_head_id,
+        gauntlet_head_version_id=tour.gauntlet_head_version_id,
         participants=[
             TournamentParticipantOut.model_validate(p) for p in tour.participants
         ],

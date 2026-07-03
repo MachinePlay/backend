@@ -152,7 +152,92 @@ async def test_gauntlet_requires_head_among_participants() -> None:
                     name="g",
                     format=TournamentFormat.GAUNTLET,
                     entries=_entries(*engines),
-                    gauntlet_head_id=uuid4(),  # not a participant
+                    gauntlet_head_index=5,  # out of range
+                    runner_id=conn.runner_id,
+                ),
+            )
+    finally:
+        _cleanup(conn)
+
+
+async def test_gauntlet_head_stored_by_version() -> None:
+    user = await User(github_id=11, login="ken").insert()
+    engines = [await _engine(user, n) for n in ("a", "b", "c")]
+    conn = await _online_runner(user, max_games=1)
+    try:
+        tour = await tournaments.create_tournament(
+            user,
+            TournamentCreateRequest(
+                name="g",
+                format=TournamentFormat.GAUNTLET,
+                entries=_entries(*engines),
+                gauntlet_head_index=1,  # engine "b" is the head
+                games_per_pairing=1,
+                runner_id=conn.runner_id,
+            ),
+        )
+        head = tour.participants[1]
+        assert tour.gauntlet_head_version_id == head.version_id
+        # Gauntlet: head vs the other two, one game each.
+        assert await Game.find(Game.tournament_id == tour.id).count() == 2
+    finally:
+        _cleanup(conn)
+
+
+async def test_same_engine_two_versions_are_distinct_participants() -> None:
+    user = await User(github_id=12, login="lily").insert()
+    e1 = await _engine(user, "a")  # version "v1"
+    v1 = await EngineVersion.find_one({"engine.$id": e1.id})
+    assert v1 is not None
+    v2 = await EngineVersion(
+        engine=e1,
+        version="v2",
+        image_repository="lily/a",
+        image_digest="sha256:a2",
+    ).insert()
+    conn = await _online_runner(user, max_games=2)
+    try:
+        # The same engine enters twice, at v1 and v2 — a valid 2-player event.
+        tour = await tournaments.create_tournament(
+            user,
+            TournamentCreateRequest(
+                name="selfplay",
+                format=TournamentFormat.ROUND_ROBIN,
+                entries=[
+                    TournamentEntry(engine_id=e1.id, version_id=v1.id),
+                    TournamentEntry(engine_id=e1.id, version_id=v2.id),
+                ],
+                games_per_pairing=2,
+                runner_id=conn.runner_id,
+            ),
+        )
+        assert len(tour.participants) == 2
+        # Distinct standings rows keyed by version, same engine name.
+        detail = await tournaments.tournament_detail(tour.id)
+        assert len(detail.standings) == 2
+        assert {s.version for s in detail.standings} == {"v1", "v2"}
+        assert {s.engine_name for s in detail.standings} == {"a"}
+    finally:
+        _cleanup(conn)
+
+
+async def test_rejects_exact_duplicate_participant() -> None:
+    user = await User(github_id=13, login="mona").insert()
+    e1 = await _engine(user, "a")
+    v1 = await EngineVersion.find_one({"engine.$id": e1.id})
+    assert v1 is not None
+    conn = await _online_runner(user, max_games=2)
+    try:
+        with pytest.raises(ConflictError):
+            await tournaments.create_tournament(
+                user,
+                TournamentCreateRequest(
+                    name="dup",
+                    format=TournamentFormat.ROUND_ROBIN,
+                    entries=[
+                        TournamentEntry(engine_id=e1.id, version_id=v1.id),
+                        TournamentEntry(engine_id=e1.id, version_id=v1.id),
+                    ],
                     runner_id=conn.runner_id,
                 ),
             )

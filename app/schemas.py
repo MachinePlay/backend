@@ -171,6 +171,9 @@ class GameOut(BaseModel):
     black_name: str
     white_version: str
     black_version: str
+    # Exact version each side played; keys standings by (engine, version).
+    white_version_id: UUID | None = None
+    black_version_id: UUID | None = None
     status: GameStatus
     result: str | None
     reason: str | None = None
@@ -207,12 +210,13 @@ class TournamentEntry(BaseModel):
 class TournamentCreateRequest(BaseModel):
     name: str
     format: TournamentFormat
-    # Participants (engine + optional version). Engines must be distinct;
-    # between 2 and the participant cap.
+    # Participants (engine + optional version). Each (engine, version) pair must
+    # be distinct — the same engine may enter at two versions. Between 2 and the
+    # participant cap.
     entries: list[TournamentEntry]
-    # Required for GAUNTLET (must be one of the entries' engine_id); ignored for
-    # round robin.
-    gauntlet_head_id: UUID | None = None
+    # Required for GAUNTLET: the index into `entries` of the head participant.
+    # Ignored for round robin.
+    gauntlet_head_index: int | None = None
     # Games each pairing plays (colors alternate). Odd values allowed.
     games_per_pairing: int = 2
     # The runner every game plays on (must be online).
@@ -231,10 +235,15 @@ class TournamentParticipantOut(BaseModel):
 
 
 class StandingRow(BaseModel):
-    """One participant's tally over the tournament's finished (ENDED) games."""
+    """One participant's tally over the tournament's finished (ENDED) games.
+
+    A participant is an (engine, version) pair; version_id is its stable key.
+    """
 
     engine_id: UUID
     engine_name: str
+    version_id: UUID
+    version: str
     played: int
     wins: int
     draws: int
@@ -267,7 +276,7 @@ class TournamentDetailOut(BaseModel):
     created_by: str
     tc: str
     games_per_pairing: int
-    gauntlet_head_id: UUID | None
+    gauntlet_head_version_id: UUID | None
     participants: list[TournamentParticipantOut]
     standings: list[StandingRow]
     games: list[GameOut]

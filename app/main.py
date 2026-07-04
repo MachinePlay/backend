@@ -57,13 +57,22 @@ TAGS_METADATA = [
         "CLI tokens, and the Docker registry token endpoint.",
     },
     {
-        "name": "Engines & profiles",
-        "description": "Public user profiles and the engines they've uploaded.",
+        "name": "Engines",
+        "description": "The engine catalog: uploaded engines, their image "
+        "versions, registration from the CLI, and deletion.",
     },
     {
-        "name": "Games & runners",
-        "description": "Start games, browse results, and see the connected "
-        "runners that play them.",
+        "name": "Profiles",
+        "description": "Public user profiles.",
+    },
+    {
+        "name": "Runners",
+        "description": "The machines that play games: registered runners with "
+        "their hardware and live online status.",
+    },
+    {
+        "name": "Games",
+        "description": "Start games and browse live or finished ones.",
     },
     {
         "name": "Tournaments",

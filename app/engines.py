@@ -1,13 +1,17 @@
-"""Engine catalog: registering pushed images, listing, and page assembly."""
+"""Engine catalog: registering pushed images, listing, deletion, and page
+assembly."""
 
 import logging
 import re
 from uuid import UUID
 
+from machineplay.schemas import GameStatus
+
+from app import registry
 from app.config import settings
-from app.exceptions import ConflictError, NotFoundError
+from app.exceptions import ConflictError, ForbiddenError, NotFoundError
 from app.games import recent_games
-from app.models import Engine, EngineVersion, User
+from app.models import Engine, EngineVersion, Game, User
 from app.schemas import (
     EngineDetailOut,
     EngineOut,
@@ -81,6 +85,67 @@ async def detail(engine: Engine) -> EngineDetailOut:
         versions=[EngineVersionOut.model_validate(v) for v in versions],
         games=[GameOut.model_validate(g) for g in games],
     )
+
+
+async def delete_engine(user: User, engine: Engine) -> None:
+    """Delete an engine, its versions, and (best-effort) its registry images.
+
+    Owner or admin only, and refused while the engine has games pending or
+    playing. Finished games are kept — they carry denormalized names, so
+    history still renders after the engine is gone.
+
+    Registry cleanup happens after the DB delete: each version's manifest is
+    removed from the engine's own repository unless some surviving
+    EngineVersion still references the exact same repository+digest (e.g. an
+    identical re-upload). Failures are logged, not raised — an orphaned
+    manifest only costs disk until GC, while a half-deleted engine would be
+    user-visible.
+    """
+    if engine.owner.ref.id != user.id and not user.is_admin:
+        raise ForbiddenError("only the owner can delete an engine")
+    active = await Game.find(
+        {
+            "$or": [{"white.$id": engine.id}, {"black.$id": engine.id}],
+            "status": {"$in": [GameStatus.PENDING, GameStatus.PLAYING]},
+        }
+    ).count()
+    if active:
+        raise ConflictError(
+            f"engine has {active} game(s) pending or playing; "
+            "cancel them or wait for them to finish"
+        )
+
+    versions = await EngineVersion.find({"engine.$id": engine.id}).to_list()
+    await EngineVersion.find({"engine.$id": engine.id}).delete()
+    await engine.delete()
+    logger.info(
+        "deleted engine %s/%s id=%s (%d versions)",
+        engine.owner_login,
+        engine.name,
+        engine.id,
+        len(versions),
+    )
+
+    for repository, digest in {(v.image_repository, v.image_digest) for v in versions}:
+        shared = await EngineVersion.find_one(
+            EngineVersion.image_repository == repository,
+            EngineVersion.image_digest == digest,
+        )
+        if shared is not None:
+            logger.info(
+                "keeping manifest %s@%s: still referenced by another engine version",
+                repository,
+                digest,
+            )
+            continue
+        try:
+            await registry.delete_manifest(repository, digest)
+        except Exception:
+            logger.exception(
+                "registry cleanup failed for %s@%s (image orphaned until GC)",
+                repository,
+                digest,
+            )
 
 
 async def register_version(

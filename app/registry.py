@@ -23,11 +23,13 @@ what docker/distribution's libtrust computes for the same cert.
 
 import base64
 import hashlib
+import logging
 import secrets
 import time
 from dataclasses import dataclass
 from functools import lru_cache
 
+import httpx
 import jwt
 from cryptography import x509
 from cryptography.hazmat.primitives import serialization
@@ -36,6 +38,8 @@ from cryptography.hazmat.primitives.asymmetric.rsa import RSAPrivateKey
 from app.config import settings
 from app.models import User, utcnow
 from app.schemas import RegistryTokenOut
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -154,6 +158,43 @@ def issue_token(user: User | None, scopes: list[str]) -> RegistryTokenOut:
         access_token=token,
         expires_in=ttl,
         issued_at=utcnow().isoformat(),
+    )
+
+
+async def delete_manifest(repository: str, digest: str) -> None:
+    """Delete one manifest from the registry (distribution requires the digest,
+    not a tag). Raises on anything but "deleted" or "already gone".
+
+    Manifests are per-repository links; image blobs are content-addressed and
+    shared registry-wide, and only the offline garbage collector removes blobs
+    no manifest references anymore. So deleting a manifest under one user's
+    repository can't break another user who pushed the identical image — their
+    repository keeps its own manifest, which keeps the shared blobs alive.
+
+    No-op when REGISTRY_API_URL is unset (local dev without a registry).
+    """
+    if not settings.registry_api_url:
+        logger.info(
+            "REGISTRY_API_URL not set; skipping manifest delete %s@%s",
+            repository,
+            digest,
+        )
+        return
+    # The registry enforces token auth on every request, so mint ourselves one:
+    # DELETE endpoints require the "delete" action (never granted to users).
+    token, _ = make_token(
+        subject="machineplay-backend",
+        granted=[Access(type="repository", name=repository, actions=["delete"])],
+    )
+    url = f"{settings.registry_api_url}/v2/{repository}/manifests/{digest}"
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        resp = await client.delete(url, headers={"Authorization": f"Bearer {token}"})
+    if resp.status_code in (202, 404):  # deleted / already gone
+        logger.info("deleted manifest %s@%s (%s)", repository, digest, resp.status_code)
+        return
+    raise RuntimeError(
+        f"registry manifest delete failed for {repository}@{digest}: "
+        f"{resp.status_code} {resp.text[:200]}"
     )
 
 

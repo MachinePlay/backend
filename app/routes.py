@@ -118,9 +118,9 @@ async def registry_token(request: Request) -> RegistryTokenOut:
     return registry.issue_token(user, request.query_params.getlist("scope"))
 
 
-# --- engines & profiles -------------------------------------------------------
+# --- engines -------------------------------------------------------------------
 
-engines_router = APIRouter(tags=["Engines & profiles"])
+engines_router = APIRouter(tags=["Engines"])
 
 
 @engines_router.get("/engine", response_model=list[EngineOut])
@@ -137,12 +137,6 @@ async def register_engine(
     return await engines.register_version(user, payload)
 
 
-@engines_router.get("/user/{login}", response_model=UserProfileOut)
-async def user_profile(login: str) -> UserProfileOut:
-    """Public profile: the user, their engines, and those engines' games."""
-    return await users.profile(login)
-
-
 @engines_router.get("/user/{login}/{engine_name}", response_model=EngineDetailOut)
 async def get_engine_by_name(login: str, engine_name: str) -> EngineDetailOut:
     """Engine detail addressed GitHub-style: owner handle + engine name."""
@@ -150,24 +144,45 @@ async def get_engine_by_name(login: str, engine_name: str) -> EngineDetailOut:
     return await engines.detail(await engines.by_name(owner, engine_name))
 
 
-# --- games & runners ----------------------------------------------------------
+@engines_router.delete("/user/{login}/{engine_name}")
+async def delete_engine(
+    login: str, engine_name: str, user: User = Depends(auth.require_user)
+) -> dict[str, bool]:
+    """Delete an engine, its versions, and its registry images (owner/admin)."""
+    owner = await users.by_login(login)
+    await engines.delete_engine(user, await engines.by_name(owner, engine_name))
+    return {"success": True}
 
-games_router = APIRouter(tags=["Games & runners"])
+
+# --- profiles ------------------------------------------------------------------
+
+profiles_router = APIRouter(tags=["Profiles"])
 
 
-@games_router.get("/runners", response_model=list[RunnerOut])
+@profiles_router.get("/user/{login}", response_model=UserProfileOut)
+async def user_profile(login: str) -> UserProfileOut:
+    """Public profile: the user, their engines, and those engines' games."""
+    return await users.profile(login)
+
+
+# --- runners --------------------------------------------------------------------
+
+runners_router = APIRouter(tags=["Runners"])
+
+
+@runners_router.get("/runners", response_model=list[RunnerOut])
 async def list_runners() -> list[RunnerOut]:
     """All registered runners, durable metadata joined with live online status."""
     return await runners.list_runners()
 
 
-@games_router.get("/runner/{runner_id}", response_model=RunnerOut)
+@runners_router.get("/runner/{runner_id}", response_model=RunnerOut)
 async def get_runner(runner_id: UUID) -> RunnerOut:
     """One runner's durable metadata joined with its live online status."""
     return await runners.get_runner(runner_id)
 
 
-@games_router.patch("/runner/{runner_id}", response_model=RunnerOut)
+@runners_router.patch("/runner/{runner_id}", response_model=RunnerOut)
 async def update_runner(
     runner_id: UUID,
     payload: RunnerUpdateRequest,
@@ -175,6 +190,11 @@ async def update_runner(
 ) -> RunnerOut:
     """Edit a runner's name/description (owner only)."""
     return await runners.edit_runner(user, runner_id, payload)
+
+
+# --- games ----------------------------------------------------------------------
+
+games_router = APIRouter(tags=["Games"])
 
 
 @games_router.post("/game")
@@ -287,6 +307,8 @@ async def sse_runner_stream() -> AsyncIterable[RunnerLiveEvent]:
 # Mount the grouped sub-routers onto the router that `app.main` includes.
 router.include_router(auth_router)
 router.include_router(engines_router)
+router.include_router(profiles_router)
 router.include_router(games_router)
+router.include_router(runners_router)
 router.include_router(tournaments_router)
 router.include_router(streaming_router)

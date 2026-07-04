@@ -36,6 +36,11 @@ class Settings(BaseSettings):
     )
     # How long an issued registry token is valid (seconds).
     registry_token_ttl: int = Field(default=300, validation_alias="REGISTRY_TOKEN_TTL")
+    # Base URL the backend itself calls the registry's HTTP API on (manifest
+    # deletes when an engine is removed). On the VPS the two are co-located, so
+    # this is http://127.0.0.1:5000. Empty (the dev default) skips registry
+    # cleanup entirely.
+    registry_api_url: str = Field(default="", validation_alias="REGISTRY_API_URL")
 
     mongo_url: str = Field(
         default="mongodb://localhost:27017", validation_alias="MONGO_URL"

@@ -41,6 +41,9 @@ class ApiToken(UUIDDocument):
 class Engine(UUIDDocument):
     name: str
     description: str = ""
+    # Free-form keywords describing the engine ("python", "mcts", "rust"),
+    # normalized and validated in app/engines.py.
+    tags: list[str] = Field(default_factory=list)
     # Engines are namespaced per owner: (owner, name) is unique. owner_login is
     # denormalized for display, mirroring how Game stores white_name/black_name.
     owner: Link[User]

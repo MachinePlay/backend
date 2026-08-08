@@ -26,6 +26,7 @@ from app.schemas import (
     EngineOut,
     EngineRegisterRequest,
     EngineRegisterResponse,
+    EngineUpdateRequest,
     GameOut,
     LiveStreamEvent,
     PendingSignupOut,
@@ -142,6 +143,19 @@ async def get_engine_by_name(login: str, engine_name: str) -> EngineDetailOut:
     """Engine detail addressed GitHub-style: owner handle + engine name."""
     owner = await users.by_login(login)
     return await engines.detail(await engines.by_name(owner, engine_name))
+
+
+@engines_router.patch("/user/{login}/{engine_name}", response_model=EngineDetailOut)
+async def update_engine(
+    login: str,
+    engine_name: str,
+    payload: EngineUpdateRequest,
+    user: User = Depends(auth.require_user),
+) -> EngineDetailOut:
+    """Edit an engine's name/description/tags (owner or admin)."""
+    owner = await users.by_login(login)
+    engine = await engines.by_name(owner, engine_name)
+    return await engines.detail(await engines.edit_engine(user, engine, payload))
 
 
 @engines_router.delete("/user/{login}/{engine_name}")

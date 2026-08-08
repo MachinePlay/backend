@@ -1,7 +1,7 @@
 from datetime import datetime
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from app.models import TournamentFormat, TournamentStatus
 from machineplay.schemas import GameStatus, GameStreamEvent, HardwareInfo, Telemetry
@@ -98,6 +98,7 @@ class EngineOut(BaseModel):
     id: UUID
     name: str
     description: str
+    tags: list[str]
     owner_login: str
     version_count: int = 0
 
@@ -117,10 +118,19 @@ class EngineDetailOut(BaseModel):
     id: UUID
     name: str
     description: str
+    tags: list[str]
     owner_login: str
     created_at: datetime
     versions: list[EngineVersionOut]
     games: list["GameOut"]
+
+
+class EngineUpdateRequest(BaseModel):
+    # Owner-editable metadata. Omitted fields are left unchanged; `tags`
+    # replaces the whole list. Renaming moves the engine's URL.
+    name: str | None = Field(default=None, max_length=64)
+    description: str | None = Field(default=None, max_length=500)
+    tags: list[str] | None = None
 
 
 class EngineRegisterRequest(BaseModel):

@@ -88,6 +88,112 @@ async def test_list_engines_returns_inserted() -> None:
     assert sf["description"] == "sf"
 
 
+async def test_edit_engine_owner() -> None:
+    alice = await User(github_id=1, login="alice").insert()
+    engine = await _engine_with_version(alice, "sf")
+
+    async with _client(as_user=alice) as client:
+        resp = await client.patch(
+            "/user/alice/sf",
+            json={
+                "name": "Stockfish",
+                "description": "  the strong one  ",
+                "tags": ["C++", "nnue", "c++", " ", "alpha-beta"],
+            },
+        )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["name"] == "stockfish"
+    assert body["description"] == "the strong one"
+    # Lowercased, de-duplicated, blanks dropped, order preserved.
+    assert body["tags"] == ["c++", "nnue", "alpha-beta"]
+    # The engine moved to its new URL; its versions came along.
+    reloaded = await Engine.get(engine.id)
+    assert reloaded is not None and reloaded.name == "stockfish"
+    assert len(body["versions"]) == 1
+
+
+async def test_edit_engine_leaves_omitted_fields_alone() -> None:
+    alice = await User(github_id=1, login="alice").insert()
+    await Engine(
+        name="sf",
+        description="keep me",
+        tags=["python"],
+        owner=alice,
+        owner_login="alice",
+    ).insert()
+
+    async with _client(as_user=alice) as client:
+        resp = await client.patch("/user/alice/sf", json={"name": "sf2"})
+
+    assert resp.status_code == 200
+    assert resp.json()["description"] == "keep me"
+    assert resp.json()["tags"] == ["python"]
+
+
+async def test_edit_engine_rejects_bad_name_tags_and_clashes() -> None:
+    alice = await User(github_id=1, login="alice").insert()
+    await _engine_with_version(alice, "sf")
+    await _engine_with_version(alice, "lc0")
+
+    async with _client(as_user=alice) as client:
+        # Not a slug, an existing name in the same namespace, a bad tag, and
+        # more tags than the cap.
+        assert (
+            await client.patch("/user/alice/sf", json={"name": "Not A Slug"})
+        ).status_code == 409
+        assert (
+            await client.patch("/user/alice/sf", json={"name": "lc0"})
+        ).status_code == 409
+        assert (
+            await client.patch("/user/alice/sf", json={"tags": ["not a tag"]})
+        ).status_code == 409
+        assert (
+            await client.patch(
+                "/user/alice/sf", json={"tags": [f"t{i}" for i in range(11)]}
+            )
+        ).status_code == 409
+
+    assert (await Engine.find_one(Engine.name == "sf")) is not None
+
+
+async def test_edit_engine_requires_owner_or_admin() -> None:
+    alice = await User(github_id=1, login="alice").insert()
+    bob = await User(github_id=2, login="bob").insert()
+    admin = await User(github_id=3, login="root", is_admin=True).insert()
+    await _engine_with_version(alice, "sf")
+
+    async with _client() as client:
+        assert (
+            await client.patch("/user/alice/sf", json={"description": "x"})
+        ).status_code == 401
+    async with _client(as_user=bob) as client:
+        assert (
+            await client.patch("/user/alice/sf", json={"description": "x"})
+        ).status_code == 403
+    async with _client(as_user=admin) as client:
+        assert (
+            await client.patch("/user/alice/sf", json={"description": "x"})
+        ).status_code == 200
+
+
+async def test_edit_engine_rename_frees_the_old_name() -> None:
+    """A rename doesn't squat its old name: re-uploading under it creates a
+    fresh engine rather than colliding on the (owner, name) unique index."""
+    alice = await User(github_id=1, login="alice").insert()
+    original = await _engine_with_version(alice, "sf")
+
+    async with _client(as_user=alice) as client:
+        assert (
+            await client.patch("/user/alice/sf", json={"name": "sf-old"})
+        ).status_code == 200
+
+    revived = await Engine(name="sf", owner=alice, owner_login="alice").insert()
+    assert revived.id != original.id
+    assert await Engine.find({"owner.$id": alice.id}).count() == 2
+
+
 async def test_delete_engine_owner(manifest_deletes: list[tuple[str, str]]) -> None:
     alice = await User(github_id=1, login="alice").insert()
     engine = await _engine_with_version(alice, "sf", digest="sha256:aaa")

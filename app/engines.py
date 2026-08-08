@@ -17,6 +17,7 @@ from app.schemas import (
     EngineOut,
     EngineRegisterRequest,
     EngineRegisterResponse,
+    EngineUpdateRequest,
     EngineVersionOut,
     GameOut,
 )
@@ -27,6 +28,36 @@ logger = logging.getLogger(__name__)
 # repository paths, so they are lowercase slugs: a-z/0-9 with single interior
 # separators (. _ -), max 64 chars.
 ENGINE_NAME_RE = re.compile(r"^[a-z0-9](?:[._-]?[a-z0-9]){0,63}$")
+
+# Tags are keywords describing an engine ("python", "mcts", "rust"). Lowercase
+# like every other user-facing slug, but `+`/`#` are allowed so "c++" and "c#"
+# work. Capped in count and length so they stay renderable as pills.
+TAG_RE = re.compile(r"^[a-z0-9+#](?:[._-]?[a-z0-9+#]){0,23}$")
+MAX_TAGS = 10
+
+ENGINE_NAME_ERROR = (
+    "engine name must be 1-64 characters: a-z, 0-9 and single "
+    "interior separators (. _ -)"
+)
+
+
+def normalize_tags(raw: list[str]) -> list[str]:
+    """Lowercase, drop blanks, de-duplicate (keeping order) and validate."""
+    tags: list[str] = []
+    for entry in raw:
+        tag = entry.strip().lower()
+        if not tag:
+            continue
+        if not TAG_RE.fullmatch(tag):
+            raise ConflictError(
+                f"invalid tag {tag!r}: tags are 1-24 characters of a-z, 0-9, "
+                "+ and #, with single interior separators (. _ -)"
+            )
+        if tag not in tags:
+            tags.append(tag)
+    if len(tags) > MAX_TAGS:
+        raise ConflictError(f"at most {MAX_TAGS} tags per engine")
+    return tags
 
 
 async def _version_counts(engine_ids: list[UUID]) -> dict[UUID, int]:
@@ -49,6 +80,7 @@ async def to_out(engines: list[Engine]) -> list[EngineOut]:
             id=e.id,
             name=e.name,
             description=e.description,
+            tags=e.tags,
             owner_login=e.owner_login,
             version_count=counts.get(e.id, 0),
         )
@@ -80,11 +112,44 @@ async def detail(engine: Engine) -> EngineDetailOut:
         id=engine.id,
         name=engine.name,
         description=engine.description,
+        tags=engine.tags,
         owner_login=engine.owner_login,
         created_at=engine.created_at,
         versions=[EngineVersionOut.model_validate(v) for v in versions],
         games=[GameOut.model_validate(g) for g in games],
     )
+
+
+async def edit_engine(user: User, engine: Engine, patch: EngineUpdateRequest) -> Engine:
+    """Owner/admin-only edit of an engine's name, description and tags.
+
+    Renaming only moves the engine's URL: uploaded versions keep pointing at
+    the registry repository they were pushed to, and a digest-pinned pull does
+    not care what the engine is called. The next `machineplay upload` under the
+    *old* name would find-or-create a fresh engine, though.
+    """
+    if engine.owner.ref.id != user.id and not user.is_admin:
+        raise ForbiddenError("only the owner can edit an engine")
+
+    if patch.name is not None:
+        name = patch.name.strip().lower()
+        if not ENGINE_NAME_RE.fullmatch(name):
+            raise ConflictError(ENGINE_NAME_ERROR)
+        if name != engine.name:
+            clash = await Engine.find_one(
+                {"owner.$id": engine.owner.ref.id}, Engine.name == name
+            )
+            if clash is not None:
+                raise ConflictError(f"{engine.owner_login}/{name} already exists")
+            engine.name = name
+    if patch.description is not None:
+        engine.description = patch.description.strip()
+    if patch.tags is not None:
+        engine.tags = normalize_tags(patch.tags)
+
+    await engine.save()
+    logger.info("edited engine %s/%s id=%s", engine.owner_login, engine.name, engine.id)
+    return engine
 
 
 async def delete_engine(user: User, engine: Engine) -> None:
@@ -164,10 +229,7 @@ async def register_version(
     if not (name and version and repository and digest):
         raise ConflictError("name, version, repository and digest are required")
     if not ENGINE_NAME_RE.fullmatch(name):
-        raise ConflictError(
-            "engine name must be 1-64 characters: a-z, 0-9 and single "
-            "interior separators (. _ -)"
-        )
+        raise ConflictError(ENGINE_NAME_ERROR)
 
     # Defense in depth: the token issuer only grants push under the user's own
     # namespace, but re-check here so a leaked token can't register an image

@@ -133,6 +133,13 @@ class EngineUpdateRequest(BaseModel):
     tags: list[str] | None = None
 
 
+class EngineVersionUpdateRequest(BaseModel):
+    # Owner-editable metadata of one uploaded version. Renaming only moves the
+    # label: the image stays pinned by repository+digest, and games/tournaments
+    # keep the version string they recorded when they were played.
+    version: str | None = Field(default=None, max_length=64)
+
+
 class EngineRegisterRequest(BaseModel):
     # URL-safe engine name chosen at upload (machineplay.org/{login}/{name}).
     name: str

@@ -19,6 +19,7 @@ from app.schemas import (
     EngineRegisterResponse,
     EngineUpdateRequest,
     EngineVersionOut,
+    EngineVersionUpdateRequest,
     GameOut,
 )
 
@@ -38,6 +39,17 @@ MAX_TAGS = 10
 ENGINE_NAME_ERROR = (
     "engine name must be 1-64 characters: a-z, 0-9 and single "
     "interior separators (. _ -)"
+)
+
+# A version string labels one uploaded image and becomes its docker tag, so it
+# follows docker's tag grammar — mixed case allowed, unlike engine names — and
+# is capped at 64 chars so version rows stay renderable. `machineplay upload`
+# checks the same shape before it pushes.
+ENGINE_VERSION_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._-]{0,63}$")
+
+ENGINE_VERSION_ERROR = (
+    "version must be 1-64 characters of letters, digits, '.', '_' and '-', "
+    "starting with a letter, digit or '_'"
 )
 
 
@@ -120,6 +132,24 @@ async def detail(engine: Engine) -> EngineDetailOut:
     )
 
 
+def _require_owner(user: User, engine: Engine, action: str) -> None:
+    """Owner-or-admin gate for everything that mutates an engine."""
+    if engine.owner.ref.id != user.id and not user.is_admin:
+        raise ForbiddenError(f"only the owner can {action}")
+
+
+async def version_by_id(engine: Engine, version_id: UUID) -> EngineVersion:
+    """One of `engine`'s uploaded versions, by id.
+
+    A version id belonging to some *other* engine is a 404 here, not a 403: the
+    URL names an engine and a version that don't go together.
+    """
+    version = await EngineVersion.get(version_id)
+    if version is None or version.engine.ref.id != engine.id:
+        raise NotFoundError("engine version not found")
+    return version
+
+
 async def edit_engine(user: User, engine: Engine, patch: EngineUpdateRequest) -> Engine:
     """Owner/admin-only edit of an engine's name, description and tags.
 
@@ -128,8 +158,7 @@ async def edit_engine(user: User, engine: Engine, patch: EngineUpdateRequest) ->
     not care what the engine is called. The next `machineplay upload` under the
     *old* name would find-or-create a fresh engine, though.
     """
-    if engine.owner.ref.id != user.id and not user.is_admin:
-        raise ForbiddenError("only the owner can edit an engine")
+    _require_owner(user, engine, "edit an engine")
 
     if patch.name is not None:
         name = patch.name.strip().lower()
@@ -152,45 +181,105 @@ async def edit_engine(user: User, engine: Engine, patch: EngineUpdateRequest) ->
     return engine
 
 
-async def delete_engine(user: User, engine: Engine) -> None:
-    """Delete an engine, its versions, and (best-effort) its registry images.
+async def edit_version(
+    user: User, engine: Engine, version_id: UUID, patch: EngineVersionUpdateRequest
+) -> EngineVersion:
+    """Owner/admin-only rename of one uploaded version's label.
 
-    Owner or admin only, and refused while the engine has games pending or
-    playing. Finished games are kept — they carry denormalized names, so
-    history still renders after the engine is gone.
-
-    Registry cleanup happens after the DB delete: each version's manifest is
-    removed from the engine's own repository unless some surviving
-    EngineVersion still references the exact same repository+digest (e.g. an
-    identical re-upload). Failures are logged, not raised — an orphaned
-    manifest only costs disk until GC, while a half-deleted engine would be
-    user-visible.
+    Only the label moves. The image stays pinned by repository+digest (the
+    registry tag written at upload is never read back), and games and
+    tournament participants keep the denormalized version string they recorded,
+    so old history keeps reading the way it was played.
     """
-    if engine.owner.ref.id != user.id and not user.is_admin:
-        raise ForbiddenError("only the owner can delete an engine")
+    _require_owner(user, engine, "edit a version")
+    version = await version_by_id(engine, version_id)
+
+    if patch.version is not None:
+        label = patch.version.strip()
+        if not ENGINE_VERSION_RE.fullmatch(label):
+            raise ConflictError(ENGINE_VERSION_ERROR)
+        if label != version.version:
+            clash = await EngineVersion.find_one(
+                {"engine.$id": engine.id}, EngineVersion.version == label
+            )
+            if clash is not None:
+                raise ConflictError(
+                    f"version {label!r} already exists for "
+                    f"{engine.owner_login}/{engine.name}"
+                )
+            logger.info(
+                "renamed %s/%s version %s -> %s (id=%s)",
+                engine.owner_login,
+                engine.name,
+                version.version,
+                label,
+                version.id,
+            )
+            version.version = label
+            await version.save()
+
+    return version
+
+
+async def delete_version(user: User, engine: Engine, version_id: UUID) -> None:
+    """Delete one uploaded version and (best-effort) its registry image.
+
+    Owner or admin only, and refused while that exact version is in a pending
+    or playing game. That also covers a running tournament: its pairings all
+    exist as PENDING games from creation, so an entered version can't vanish
+    mid-tournament.
+
+    Finished games and tournament participant snapshots survive — they carry
+    denormalized engine/version strings, so history still renders — but the
+    version is gone from the engine page and can't be picked for new games.
+
+    Deleting the last version is allowed: the engine stays, marked as having
+    nothing to play, and starting a game against it fails until something is
+    uploaded again. Emptiness is recoverable (upload another version), while
+    auto-deleting the engine would silently take its description, tags and URL
+    with it.
+    """
+    _require_owner(user, engine, "delete a version")
+    version = await version_by_id(engine, version_id)
+
+    # Matched on engine *and* version id so the query rides the white/black
+    # engine indexes; a version belongs to exactly one engine, so that's the
+    # same set of games as matching the version id alone.
     active = await Game.find(
         {
-            "$or": [{"white.$id": engine.id}, {"black.$id": engine.id}],
+            "$or": [
+                {"white.$id": engine.id, "white_version_id": version.id},
+                {"black.$id": engine.id, "black_version_id": version.id},
+            ],
             "status": {"$in": [GameStatus.PENDING, GameStatus.PLAYING]},
         }
     ).count()
     if active:
         raise ConflictError(
-            f"engine has {active} game(s) pending or playing; "
-            "cancel them or wait for them to finish"
+            f"version {version.version!r} has {active} game(s) pending or "
+            "playing; cancel them or wait for them to finish"
         )
 
-    versions = await EngineVersion.find({"engine.$id": engine.id}).to_list()
-    await EngineVersion.find({"engine.$id": engine.id}).delete()
-    await engine.delete()
+    await version.delete()
     logger.info(
-        "deleted engine %s/%s id=%s (%d versions)",
+        "deleted %s/%s version=%s id=%s",
         engine.owner_login,
         engine.name,
-        engine.id,
-        len(versions),
+        version.version,
+        version.id,
     )
+    await _delete_manifests([version])
 
+
+async def _delete_manifests(versions: list[EngineVersion]) -> None:
+    """Drop deleted versions' images from the registry, best effort.
+
+    Call *after* the EngineVersion docs are gone: each distinct
+    repository+digest is removed unless some surviving version still references
+    it (an identical re-upload, or the same image registered under two
+    engines). Failures are logged, not raised — an orphaned manifest only costs
+    disk until GC, while a half-done delete would be user-visible.
+    """
     for repository, digest in {(v.image_repository, v.image_digest) for v in versions}:
         shared = await EngineVersion.find_one(
             EngineVersion.image_repository == repository,
@@ -213,6 +302,39 @@ async def delete_engine(user: User, engine: Engine) -> None:
             )
 
 
+async def delete_engine(user: User, engine: Engine) -> None:
+    """Delete an engine, its versions, and (best-effort) its registry images.
+
+    Owner or admin only, and refused while the engine has games pending or
+    playing. Finished games are kept — they carry denormalized names, so
+    history still renders after the engine is gone.
+    """
+    _require_owner(user, engine, "delete an engine")
+    active = await Game.find(
+        {
+            "$or": [{"white.$id": engine.id}, {"black.$id": engine.id}],
+            "status": {"$in": [GameStatus.PENDING, GameStatus.PLAYING]},
+        }
+    ).count()
+    if active:
+        raise ConflictError(
+            f"engine has {active} game(s) pending or playing; "
+            "cancel them or wait for them to finish"
+        )
+
+    versions = await EngineVersion.find({"engine.$id": engine.id}).to_list()
+    await EngineVersion.find({"engine.$id": engine.id}).delete()
+    await engine.delete()
+    logger.info(
+        "deleted engine %s/%s id=%s (%d versions)",
+        engine.owner_login,
+        engine.name,
+        engine.id,
+        len(versions),
+    )
+    await _delete_manifests(versions)
+
+
 async def register_version(
     user: User, payload: EngineRegisterRequest
 ) -> EngineRegisterResponse:
@@ -230,6 +352,8 @@ async def register_version(
         raise ConflictError("name, version, repository and digest are required")
     if not ENGINE_NAME_RE.fullmatch(name):
         raise ConflictError(ENGINE_NAME_ERROR)
+    if not ENGINE_VERSION_RE.fullmatch(version):
+        raise ConflictError(ENGINE_VERSION_ERROR)
 
     # Defense in depth: the token issuer only grants push under the user's own
     # namespace, but re-check here so a leaked token can't register an image

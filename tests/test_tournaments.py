@@ -3,7 +3,7 @@ from uuid import uuid4
 import pytest
 from machineplay.schemas import GameEndEvent, GameStatus
 
-from app import runners, streaming, tournaments
+from app import engines, runners, streaming, tournaments
 from app.exceptions import ConflictError, ForbiddenError
 from app.models import (
     Engine,
@@ -503,3 +503,51 @@ async def test_cancel_forbidden_for_non_creator() -> None:
             await tournaments.cancel_tournament(other, tour.id)
     finally:
         _cleanup(conn)
+
+
+async def test_deleting_an_entered_version_keeps_tournament_history(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Standings and participants render from the snapshot taken at creation,
+    so deleting a version a finished tournament played doesn't erase it."""
+
+    async def fake_manifest_delete(repository: str, digest: str) -> None:
+        return None
+
+    monkeypatch.setattr("app.registry.delete_manifest", fake_manifest_delete)
+    user = await User(github_id=9, login="alice").insert()
+    a, b = [await _engine(user, n) for n in ("a", "b")]
+    conn = await _online_runner(user, max_games=2)
+    try:
+        tour = await tournaments.create_tournament(
+            user,
+            TournamentCreateRequest(
+                name="cup",
+                format=TournamentFormat.ROUND_ROBIN,
+                entries=_entries(a, b),
+                games_per_pairing=2,
+                runner_id=conn.runner_id,
+            ),
+        )
+        for doc in await Game.find(Game.tournament_id == tour.id).to_list():
+            doc.status = GameStatus.ENDED
+            doc.result = "1-0"
+            await doc.save()
+
+        played = await EngineVersion.find_one({"engine.$id": a.id})
+        # Re-read the engine the way a request does: an owner Link, not the
+        # in-memory User the helper inserted it with.
+        owned = await Engine.get(a.id)
+        assert played is not None and owned is not None
+        await engines.delete_version(user, owned, played.id)
+
+        detail = await tournaments.tournament_detail(tour.id)
+    finally:
+        _cleanup(conn)
+
+    assert [(p.engine_name, p.version) for p in detail.participants] == [
+        ("a", "v1"),
+        ("b", "v1"),
+    ]
+    assert {row.engine_name for row in detail.standings} == {"a", "b"}
+    assert sum(row.played for row in detail.standings) == 4

@@ -27,6 +27,7 @@ from app.schemas import (
     EngineRegisterRequest,
     EngineRegisterResponse,
     EngineUpdateRequest,
+    EngineVersionUpdateRequest,
     GameOut,
     LiveStreamEvent,
     PendingSignupOut,
@@ -165,6 +166,40 @@ async def delete_engine(
     """Delete an engine, its versions, and its registry images (owner/admin)."""
     owner = await users.by_login(login)
     await engines.delete_engine(user, await engines.by_name(owner, engine_name))
+    return {"success": True}
+
+
+@engines_router.patch(
+    "/user/{login}/{engine_name}/version/{version_id}", response_model=EngineDetailOut
+)
+async def update_engine_version(
+    login: str,
+    engine_name: str,
+    version_id: UUID,
+    payload: EngineVersionUpdateRequest,
+    user: User = Depends(auth.require_user),
+) -> EngineDetailOut:
+    """Rename one uploaded version's label (owner or admin)."""
+    owner = await users.by_login(login)
+    engine = await engines.by_name(owner, engine_name)
+    await engines.edit_version(user, engine, version_id, payload)
+    return await engines.detail(engine)
+
+
+@engines_router.delete("/user/{login}/{engine_name}/version/{version_id}")
+async def delete_engine_version(
+    login: str,
+    engine_name: str,
+    version_id: UUID,
+    user: User = Depends(auth.require_user),
+) -> dict[str, bool]:
+    """Delete one uploaded version and its registry image (owner/admin).
+
+    Refused while that version has a game pending or playing.
+    """
+    owner = await users.by_login(login)
+    engine = await engines.by_name(owner, engine_name)
+    await engines.delete_version(user, engine, version_id)
     return {"success": True}
 
 

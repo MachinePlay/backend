@@ -83,13 +83,6 @@ class RegisterRequest(BaseModel):
     login: str
 
 
-class DeleteAccountRequest(BaseModel):
-    # The account's own handle, typed out again. Deleting an account ends its
-    # live games and tournaments and destroys its engines, so the confirmation
-    # is part of the request rather than a UI-only formality.
-    login: str
-
-
 class ApiTokenOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 

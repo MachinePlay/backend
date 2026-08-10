@@ -38,13 +38,10 @@ def _client(as_user: User | None = None) -> AsyncClient:
     return client
 
 
-async def _delete_account(user: User | None, login: str) -> int:
-    """DELETE /me with the typed confirmation; returns the status code.
-
-    httpx's `.delete()` takes no body, so the request is built by hand.
-    """
+async def _delete_account(user: User | None) -> int:
+    """DELETE /me as `user`; returns the status code."""
     async with _client(as_user=user) as client:
-        resp = await client.request("DELETE", "/me", json={"login": login})
+        resp = await client.delete("/me")
     return resp.status_code
 
 
@@ -92,30 +89,27 @@ async def _tournament(
     )
 
 
-# --- confirmation ------------------------------------------------------------
+# --- who may delete ----------------------------------------------------------
 
 
 async def test_delete_account_requires_login() -> None:
-    assert await _delete_account(None, "alice") == 401
+    assert await _delete_account(None) == 401
 
 
-async def test_delete_account_requires_the_typed_handle(
+async def test_delete_account_only_deletes_the_caller(
     manifest_deletes: list[tuple[str, str]],
 ) -> None:
+    """There is no way to name a victim: /me deletes whoever authenticated."""
     alice = await User(github_id=1, login="alice").insert()
+    bob = await User(github_id=2, login="bob").insert()
     await _engine(alice, "sf")
+    await _engine(bob, "bot")
 
-    for wrong in ["", "bob", "alic"]:
-        assert await _delete_account(alice, wrong) == 409, wrong
+    assert await _delete_account(bob) == 200
 
-    # Nothing was touched by the refused attempts.
+    assert await User.get(bob.id) is None
     assert await User.get(alice.id) is not None
-    assert await Engine.find_all().count() == 1
-    assert manifest_deletes == []
-
-    # Case and surrounding whitespace are forgiven; the handle itself is not.
-    assert await _delete_account(alice, "  ALICE ") == 200
-    assert await User.get(alice.id) is None
+    assert await Engine.find({"owner.$id": alice.id}).count() == 1
 
 
 # --- what the account takes with it ------------------------------------------
@@ -132,7 +126,7 @@ async def test_delete_account_removes_engines_versions_tokens_and_runners(
         id=uuid4(), owner=alice, owner_login="alice", name="box"
     ).insert()
 
-    assert await _delete_account(alice, "alice") == 200
+    assert await _delete_account(alice) == 200
 
     assert await User.get(alice.id) is None
     assert await Engine.find_all().count() == 0
@@ -173,7 +167,7 @@ async def test_delete_account_keeps_played_history(
             ),
         )
 
-        assert await _delete_account(alice, "alice") == 200
+        assert await _delete_account(alice) == 200
     finally:
         _cleanup(conn)
 
@@ -209,7 +203,7 @@ async def test_delete_account_ends_its_running_tournament_and_games(
         # One pairing is playing, the rest are still pending.
         assert conn.active_games == 1
 
-        assert await _delete_account(alice, "alice") == 200
+        assert await _delete_account(alice) == 200
 
         stored = await Tournament.get(tour.id)
         assert stored is not None
@@ -249,7 +243,7 @@ async def test_delete_account_ends_a_standalone_game_of_its_engines(
         status=GameStatus.PENDING,
     ).insert()
 
-    assert await _delete_account(alice, "alice") == 200
+    assert await _delete_account(alice) == 200
 
     stored = await Game.get(game.id)
     assert stored is not None
@@ -271,7 +265,7 @@ async def test_delete_account_stops_someone_elses_tournament_on_its_runner(
     try:
         tour = await _tournament(bob, conn, a, b)
 
-        assert await _delete_account(alice, "alice") == 200
+        assert await _delete_account(alice) == 200
 
         stored = await Tournament.get(tour.id)
         assert stored is not None
@@ -305,7 +299,7 @@ async def test_delete_account_leaves_other_accounts_untouched(
         id=uuid4(), owner=bob, owner_login="bob", name="bobbox"
     ).insert()
 
-    assert await _delete_account(alice, "alice") == 200
+    assert await _delete_account(alice) == 200
 
     assert await User.get(bob.id) is not None
     assert await Engine.find({"owner.$id": bob.id}).count() == 1

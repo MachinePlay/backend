@@ -32,7 +32,6 @@ from app import (
 from app.models import ApiToken, Game, User
 from app.schemas import (
     ApiTokenOut,
-    DeleteAccountRequest,
     EngineDetailOut,
     EngineOut,
     EngineRegisterRequest,
@@ -102,17 +101,16 @@ async def me(user: User = Depends(auth.require_user)) -> User:
 
 @auth_router.delete("/me")
 async def delete_account(
-    request: Request,
-    payload: DeleteAccountRequest,
-    user: User = Depends(auth.require_user),
+    request: Request, user: User = Depends(auth.require_user)
 ) -> dict[str, bool]:
     """Delete the logged-in account: engines, uploaded versions and registry
     images go, live games and tournaments are ended, played history stays.
 
-    `payload.login` must repeat the account's own handle. The session is cleared
-    on the way out; signing in with GitHub again starts a brand-new account.
+    The website makes the user type their handle first; that gate is there to
+    slow a human down, so it isn't re-checked here. The session is cleared on
+    the way out; signing in with GitHub again starts a brand-new account.
     """
-    await accounts.delete_account(user, payload.login)
+    await accounts.delete_account(user)
     request.session.clear()
     return {"success": True}
 

@@ -28,7 +28,6 @@ from uuid import UUID
 from machineplay.schemas import GameStatus, StopGame
 
 from app import engines, runners, streaming, tournaments
-from app.exceptions import ConflictError
 from app.models import (
     ApiToken,
     Engine,
@@ -55,12 +54,14 @@ DELETED_LOGIN = "[deleted]"
 REASON = "owner account deleted"
 
 
-async def delete_account(user: User, confirm_login: str) -> None:
+async def delete_account(user: User) -> None:
     """Delete `user` and everything they own, ending their live work first.
 
-    `confirm_login` must be the account's own handle: the caller (the website's
-    danger-zone control) makes the user type it, and this re-checks it so a
-    stray API call can't delete an account by accident.
+    There is no confirmation argument: the website makes the user type their
+    handle before calling this, but that is a "slow the human down" gate, and
+    a caller who can authenticate as the account can always satisfy it. The
+    request itself names its own target, so there is nothing an echoed handle
+    would disambiguate.
 
     Active work is ended rather than refused — the account is going away, so
     there is nothing to come back and finish it. That deliberately reaches one
@@ -69,9 +70,6 @@ async def delete_account(user: User, confirm_login: str) -> None:
     and its token is revoked here, so it can never reconnect to dispatch the
     rest.
     """
-    if confirm_login.strip().lower() != user.login:
-        raise ConflictError(f"type {user.login!r} to confirm account deletion")
-
     logger.info("deleting account %s id=%s", user.login, user.id)
 
     # 1. Revoke access first: from here on no CLI token, registry push or

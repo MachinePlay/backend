@@ -56,3 +56,15 @@ async def clean_db(mongo_client: AsyncMongoClient[dict[str, Any]]) -> None:
     db = mongo_client["machineplay_test"]
     for name in await db.list_collection_names():
         await db[name].delete_many({})
+
+
+@pytest.fixture
+def manifest_deletes(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str]]:
+    """Record registry manifest deletes instead of calling a real registry."""
+    calls: list[tuple[str, str]] = []
+
+    async def fake(repository: str, digest: str) -> None:
+        calls.append((repository, digest))
+
+    monkeypatch.setattr("app.registry.delete_manifest", fake)
+    return calls

@@ -18,10 +18,21 @@ from fastapi.sse import EventSourceResponse
 
 from machineplay import schemas
 
-from app import auth, engines, games, registry, runners, streaming, tournaments, users
+from app import (
+    accounts,
+    auth,
+    engines,
+    games,
+    registry,
+    runners,
+    streaming,
+    tournaments,
+    users,
+)
 from app.models import ApiToken, Game, User
 from app.schemas import (
     ApiTokenOut,
+    DeleteAccountRequest,
     EngineDetailOut,
     EngineOut,
     EngineRegisterRequest,
@@ -87,6 +98,23 @@ async def logout(request: Request) -> dict[str, bool]:
 @auth_router.get("/me", response_model=UserOut)
 async def me(user: User = Depends(auth.require_user)) -> User:
     return user
+
+
+@auth_router.delete("/me")
+async def delete_account(
+    request: Request,
+    payload: DeleteAccountRequest,
+    user: User = Depends(auth.require_user),
+) -> dict[str, bool]:
+    """Delete the logged-in account: engines, uploaded versions and registry
+    images go, live games and tournaments are ended, played history stays.
+
+    `payload.login` must repeat the account's own handle. The session is cleared
+    on the way out; signing in with GitHub again starts a brand-new account.
+    """
+    await accounts.delete_account(user, payload.login)
+    request.session.clear()
+    return {"success": True}
 
 
 @auth_router.post("/me/tokens", response_model=TokenOut)

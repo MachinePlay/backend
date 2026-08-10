@@ -2,7 +2,6 @@ import json
 from base64 import b64encode
 from uuid import UUID, uuid4
 
-import pytest
 from httpx import ASGITransport, AsyncClient
 
 from machineplay.schemas import GameStatus
@@ -64,18 +63,6 @@ async def _only_version(engine: Engine) -> EngineVersion:
     version = await EngineVersion.find_one({"engine.$id": engine.id})
     assert version is not None
     return version
-
-
-@pytest.fixture
-def manifest_deletes(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str]]:
-    """Record registry manifest deletes instead of calling a real registry."""
-    calls: list[tuple[str, str]] = []
-
-    async def fake(repository: str, digest: str) -> None:
-        calls.append((repository, digest))
-
-    monkeypatch.setattr("app.registry.delete_manifest", fake)
-    return calls
 
 
 async def test_list_engines_empty() -> None:

@@ -333,6 +333,17 @@ async def cancel_tournament(user: User, tournament_id: UUID) -> None:
     if tour.creator_id != user.id and not user.is_admin:
         raise ForbiddenError("only the creator can cancel this tournament")
 
+    await abort_tournament(tour, "tournament cancelled")
+    logger.info("tournament=%s cancelled by %s", tour.id, user.login)
+
+
+async def abort_tournament(tour: Tournament, reason: str) -> None:
+    """End a RUNNING tournament now, without asking who is doing it.
+
+    `cancel_tournament` is the permission-checked entry point; account deletion
+    calls this directly for work it is tearing down on the owner's behalf.
+    `reason` lands on every game it stops, so history says why.
+    """
     # Flip to ABORTED first so no game-finished hook re-dispatches it as its
     # games are torn down.
     tour.status = TournamentStatus.ABORTED
@@ -344,7 +355,7 @@ async def cancel_tournament(user: User, tournament_id: UUID) -> None:
     ).to_list()
     for doc in playing:
         conn = runners.find_by_game(doc.id)
-        await streaming.abort_game(doc.id, reason="tournament cancelled")
+        await streaming.abort_game(doc.id, reason=reason)
         if conn is not None:
             await conn.scheduled_commands.put(StopGame(game_id=doc.id))
 
@@ -352,8 +363,7 @@ async def cancel_tournament(user: User, tournament_id: UUID) -> None:
         Game.tournament_id == tour.id, Game.status == GameStatus.PENDING
     ).to_list()
     for doc in pending:
-        await _mark_aborted(doc, "tournament cancelled")
-    logger.info("tournament=%s cancelled by %s", tour.id, user.login)
+        await _mark_aborted(doc, reason)
 
 
 # --- queries / serialization -------------------------------------------------

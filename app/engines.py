@@ -335,6 +335,32 @@ async def delete_engine(user: User, engine: Engine) -> None:
     await _delete_manifests(versions)
 
 
+async def delete_owned_engines(user: User) -> int:
+    """Delete every engine `user` owns, with its versions and registry images.
+
+    The account-deletion path, so unlike `delete_engine` it asks no questions:
+    the caller has already ended the account's active games, and anything still
+    referencing these engines (finished games, tournament participants) carries
+    denormalized names that keep rendering without them. Returns the number of
+    engines deleted.
+    """
+    owned = await Engine.find({"owner.$id": user.id}).to_list()
+    if not owned:
+        return 0
+    engine_ids = [e.id for e in owned]
+    versions = await EngineVersion.find({"engine.$id": {"$in": engine_ids}}).to_list()
+    await EngineVersion.find({"engine.$id": {"$in": engine_ids}}).delete()
+    await Engine.find({"owner.$id": user.id}).delete()
+    logger.info(
+        "deleted %d engine(s) and %d version(s) owned by %s",
+        len(owned),
+        len(versions),
+        user.login,
+    )
+    await _delete_manifests(versions)
+    return len(owned)
+
+
 async def register_version(
     user: User, payload: EngineRegisterRequest
 ) -> EngineRegisterResponse:

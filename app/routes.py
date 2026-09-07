@@ -21,6 +21,7 @@ from machineplay import schemas
 from app import (
     accounts,
     auth,
+    books,
     engines,
     games,
     registry,
@@ -32,6 +33,7 @@ from app import (
 from app.models import ApiToken, Game, User
 from app.schemas import (
     ApiTokenOut,
+    BookOut,
     EngineDetailOut,
     EngineOut,
     EngineRegisterRequest,
@@ -355,6 +357,31 @@ async def cancel_tournament(
     return {"success": True}
 
 
+# --- opening books ------------------------------------------------------------
+
+books_router = APIRouter(tags=["Opening books"])
+
+
+@books_router.get("/book", response_model=list[BookOut])
+async def list_books() -> list[BookOut]:
+    """The opening books a game or tournament can be dealt its start from.
+
+    Pass a book's `slug` as `book` when creating one, or `"none"` to play from
+    the initial position.
+    """
+    return [
+        BookOut(
+            slug=b.slug,
+            name=b.name,
+            description=b.description,
+            source=b.source,
+            plies=b.plies,
+            lines=len(b.lines),
+        )
+        for b in await books.list_books()
+    ]
+
+
 # --- live streaming -----------------------------------------------------------
 
 streaming_router = APIRouter(tags=["Live streaming"])
@@ -405,4 +432,5 @@ router.include_router(profiles_router)
 router.include_router(games_router)
 router.include_router(runners_router)
 router.include_router(tournaments_router)
+router.include_router(books_router)
 router.include_router(streaming_router)

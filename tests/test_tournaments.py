@@ -1,11 +1,13 @@
 from uuid import uuid4
 
+import chess
 import pytest
 from machineplay.schemas import GameEndEvent, GameStatus
 
-from app import engines, runners, streaming, tournaments
-from app.exceptions import ConflictError, ForbiddenError
+from app import books, engines, runners, streaming, tournaments
+from app.exceptions import ConflictError, ForbiddenError, NotFoundError
 from app.models import (
+    Book,
     Engine,
     EngineVersion,
     Game,
@@ -26,27 +28,50 @@ def test_round_robin_order_covers_every_pair_both_colors() -> None:
     # 3 unordered pairs, each played twice.
     assert len(order) == 6
     # Each unordered pair appears once with each color assignment.
+    colors = [(p.white, p.black) for p in order]
     for i, j in [(0, 1), (0, 2), (1, 2)]:
-        assert (i, j) in order
-        assert (j, i) in order
+        assert (i, j) in colors
+        assert (j, i) in colors
     # No engine ever plays itself.
-    assert all(w != b for w, b in order)
+    assert all(p.white != p.black for p in order)
 
 
 def test_round_robin_single_game_per_pairing() -> None:
     order = tournaments.round_robin_order(4, 1)
     assert len(order) == 6  # 4*3/2
-    assert all(w != b for w, b in order)
+    assert all(p.white != p.black for p in order)
 
 
 def test_gauntlet_order_head_plays_everyone() -> None:
     order = tournaments.gauntlet_order(4, 0, 2)
     # head (index 0) vs the other 3, twice each.
     assert len(order) == 6
-    assert all(0 in pair for pair in order)
+    assert all(0 in (p.white, p.black) for p in order)
     # Colors alternate: head is white in the first round, black in the second.
-    assert order[0][0] == 0
-    assert order[3][1] == 0
+    assert order[0].white == 0
+    assert order[3].black == 0
+
+
+def test_colour_reversed_twins_share_an_opening() -> None:
+    """The point of the book: a pairing's two games start from the same line,
+    one from each side, so a lopsided opening cancels instead of counting."""
+    order = tournaments.round_robin_order(3, 4)
+    by_pairing: dict[frozenset[int], list[tournaments.Pairing]] = {}
+    for pairing in order:
+        by_pairing.setdefault(frozenset((pairing.white, pairing.black)), []).append(
+            pairing
+        )
+    for played in by_pairing.values():
+        assert [p.opening for p in played] == [0, 0, 1, 1]
+        # ... and the two games sharing an opening swap colours.
+        assert played[0].white == played[1].black
+        assert played[2].white == played[3].black
+
+
+def test_gauntlet_openings_pair_by_round() -> None:
+    order = tournaments.gauntlet_order(3, 0, 4)
+    per_opponent = [p for p in order if 1 in (p.white, p.black)]
+    assert [p.opening for p in per_opponent] == [0, 0, 1, 1]
 
 
 # --- helpers -----------------------------------------------------------------
@@ -703,3 +728,116 @@ async def test_games_page_is_ordered_filtered_and_bounded() -> None:
         assert playing.games[0].status == GameStatus.PLAYING
     finally:
         _cleanup(conn)
+
+
+# --- opening books -----------------------------------------------------------
+
+
+async def test_tournament_deals_paired_openings_by_default() -> None:
+    """Every game gets a book line, and a pairing's two colour-reversed games
+    start from the same one."""
+    user = await User(github_id=40, login="booker").insert()
+    engines = [await _engine(user, n) for n in ("a", "b")]
+    conn = await _online_runner(user, max_games=1)
+    try:
+        tour = await tournaments.create_tournament(
+            user,
+            TournamentCreateRequest(
+                name="booked",
+                format=TournamentFormat.ROUND_ROBIN,
+                entries=_entries(*engines),
+                games_per_pairing=4,
+                runner_id=conn.runner_id,
+                tc="10+0.1",
+            ),
+        )
+        assert tour.book == books.DEFAULT_SLUG
+        docs = (
+            await Game.find(Game.tournament_id == tour.id)
+            .sort("+tournament_seq")
+            .to_list()
+        )
+        assert len(docs) == 4
+        assert all(len(d.opening_moves) == books.PLIES for d in docs)
+        assert all(d.book == books.DEFAULT_SLUG for d in docs)
+        # Games 0/1 share a line and swap colours; so do 2/3, on a different one.
+        assert docs[0].opening_moves == docs[1].opening_moves
+        assert docs[2].opening_moves == docs[3].opening_moves
+        assert docs[0].opening_moves != docs[2].opening_moves
+        assert docs[0].white_name == docs[1].black_name
+    finally:
+        _cleanup(conn)
+
+
+async def test_tournament_without_a_book_starts_from_the_initial_position() -> None:
+    user = await User(github_id=41, login="nobook").insert()
+    engines = [await _engine(user, n) for n in ("a", "b")]
+    conn = await _online_runner(user, max_games=1)
+    try:
+        tour = await tournaments.create_tournament(
+            user,
+            TournamentCreateRequest(
+                name="bare",
+                format=TournamentFormat.ROUND_ROBIN,
+                entries=_entries(*engines),
+                games_per_pairing=2,
+                runner_id=conn.runner_id,
+                book=books.NO_BOOK,
+            ),
+        )
+        assert tour.book is None
+        docs = await Game.find(Game.tournament_id == tour.id).to_list()
+        assert all(d.opening_moves == [] and d.book is None for d in docs)
+    finally:
+        _cleanup(conn)
+
+
+async def test_create_rejects_unknown_book() -> None:
+    user = await User(github_id=42, login="typo").insert()
+    engines = [await _engine(user, n) for n in ("a", "b")]
+    conn = await _online_runner(user, max_games=1)
+    try:
+        with pytest.raises(NotFoundError):
+            await tournaments.create_tournament(
+                user,
+                TournamentCreateRequest(
+                    name="oops",
+                    format=TournamentFormat.ROUND_ROBIN,
+                    entries=_entries(*engines),
+                    runner_id=conn.runner_id,
+                    book="perfekt-2021",
+                ),
+            )
+    finally:
+        _cleanup(conn)
+
+
+async def test_openings_are_legal_and_reach_the_book_depth() -> None:
+    """A line the runner can't play is a game that dies on arrival, so the
+    book's own contents are checked rather than trusted."""
+    book = await books.get(books.DEFAULT_SLUG)
+    assert len(book.lines) > 100
+    for line in book.lines:
+        board = chess.Board()
+        for uci in line:
+            move = chess.Move.from_uci(uci)
+            assert move in board.legal_moves, f"{line} illegal at {uci}"
+            board.push(move)
+        assert books.MIN_PLIES <= len(line) <= books.PLIES
+        assert not board.is_game_over()
+
+
+async def test_book_order_is_seed_stable_and_seed_dependent() -> None:
+    book = await books.get(books.DEFAULT_SLUG)
+    assert books.order(book, 7) == books.order(book, 7)
+    assert books.order(book, 7) != books.order(book, 8)
+    # A reordering, not a filter.
+    assert sorted(books.order(book, 7)) == sorted(book.lines)
+
+
+async def test_seed_is_idempotent() -> None:
+    before = await Book.find_all().to_list()
+    await books.seed()
+    after = await Book.find_all().to_list()
+    assert len(before) == len(after) == 1
+    assert before[0].id == after[0].id

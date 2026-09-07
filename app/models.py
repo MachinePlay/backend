@@ -97,6 +97,34 @@ class Runner(UUIDDocument):
     last_seen_at: datetime | None = None
 
 
+class Book(UUIDDocument):
+    """An opening book: the short move lines games are dealt to start from.
+
+    A line is a list of UCI moves *from the standard start position*, never a
+    FEN. fastchess takes either (`-openings format=(epd|pgn)`), but a position
+    book makes it send `position fen …`, which the starter engine refuses by
+    design until the tutorial teaches that form, and which neither the runner's
+    board nor the frontend's replay knows how to start from. Moves are moves:
+    everything downstream already handles them.
+
+    Books are seeded from the files shipped in `books/` (see app/books.py) and
+    referenced by `slug`, which survives a re-seed where the document id would
+    not. Games store the line they actually played, so history stays readable
+    even if a book is later changed or dropped.
+    """
+
+    slug: Annotated[str, Indexed(unique=True)]
+    name: str
+    description: str
+    # Where the lines came from, for attribution on the book's page.
+    source: str = ""
+    # How deep the lines are walked; a line may be shorter where the source
+    # book ran out.
+    plies: int
+    lines: list[list[str]] = Field(default_factory=list)
+    created_at: datetime = Field(default_factory=utcnow)
+
+
 class Game(UUIDDocument):
     white: Link[Engine]
     black: Link[Engine]
@@ -118,6 +146,14 @@ class Game(UUIDDocument):
     # Sorting on it keeps dispatch and the pairings list in schedule order.
     tournament_id: UUID | None = None
     tournament_seq: int | None = None
+    # The opening this game was dealt: the book's slug, and the exact line as
+    # UCI moves from the start position. The moves are stored rather than a
+    # (book, index) reference so a finished game still says what it played
+    # after the book changes, and so the runner can be handed the line without
+    # a book ever reaching it. Empty for a game started from the initial
+    # position.
+    book: str | None = None
+    opening_moves: list[str] = Field(default_factory=list)
     # A freshly-created game is PENDING until a runner slot is reserved for it
     # (schedule_game flips it to PLAYING). Defaulting to PENDING keeps a
     # not-yet-dispatched game from being treated as live or aborted-on-restart.
@@ -151,6 +187,12 @@ class Game(UUIDDocument):
     @property
     def black_id(self) -> UUID:
         return cast(UUID, self.black.ref.id)
+
+    @property
+    def book_plies(self) -> int:
+        """How many leading `moves` came from the book, so a viewer can tell
+        the opening apart from what the engines chose."""
+        return len(self.opening_moves)
 
     class Settings:
         # white/black indexes back the "games of these engines" queries on
@@ -223,6 +265,12 @@ class Tournament(UUIDDocument):
     # The participant that plays everyone else, identified by its version id (the
     # per-participant key). GAUNTLET only; None for round robin.
     gauntlet_head_version_id: UUID | None = None
+    # The opening book every pairing is dealt from, and the seed that fixes
+    # which of its lines this tournament uses and in what order. None plays
+    # every game from the initial position — which, with deterministic engines,
+    # means replaying one game per colour assignment.
+    book: str | None = None
+    book_seed: int = 0
     participants: list[TournamentParticipant] = Field(default_factory=list)
     status: TournamentStatus = TournamentStatus.RUNNING
     created_at: datetime = Field(default_factory=utcnow)

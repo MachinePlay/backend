@@ -7,6 +7,7 @@ from pymongo import AsyncMongoClient
 from app.config import settings
 from app.models import (
     ApiToken,
+    Book,
     Engine,
     EngineVersion,
     Game,
@@ -31,6 +32,7 @@ async def connect() -> AsyncMongoClient[dict[str, Any]]:
     await init_beanie(
         database=client[settings.mongo_db],
         document_models=[
+            Book,
             Engine,
             EngineVersion,
             ApiToken,

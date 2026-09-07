@@ -17,13 +17,14 @@ Two hooks drive it:
 
 import asyncio
 import logging
+import random
 from collections import Counter
 from typing import NamedTuple
 from uuid import UUID
 
 from machineplay.schemas import GameEndEvent, GameStatus, StopGame
 
-from app import games, runners, streaming
+from app import books, games, runners, streaming
 from app.config import settings
 from app.exceptions import (
     ConflictError,
@@ -32,6 +33,7 @@ from app.exceptions import (
     RunnerBusyError,
 )
 from app.models import (
+    Book,
     Engine,
     EngineVersion,
     Game,
@@ -84,29 +86,48 @@ RETRYABLE_REASONS = {"runner disconnected", "backend restarted"}
 # --- pairing generation (pure; unit-tested) ----------------------------------
 
 
-def round_robin_order(n: int, games_per_pairing: int) -> list[tuple[int, int]]:
-    """(white, black) participant-index pairs for a round robin over `n` players.
+class Pairing(NamedTuple):
+    """One scheduled game: who plays which colour, and which opening it gets.
+
+    `opening` indexes the tournament's shuffled book. It is `k // 2` for the
+    k-th game of a pairing, and colours swap on `k % 2`, so a game and its
+    colour-reversed twin start from the *same* position. That pairing is the
+    whole point of an opening book in a match: a book line is rarely dead
+    equal (Perfect 2021 is White-favouring by design), and playing each one
+    from both sides is what cancels the bias instead of handing it to whoever
+    drew White more often.
+    """
+
+    white: int
+    black: int
+    opening: int
+
+
+def round_robin_order(n: int, games_per_pairing: int) -> list[Pairing]:
+    """Pairings for a round robin over `n` players.
 
     Interleaved by round so every pairing plays its k-th game before any plays
     its (k+1)-th, and colors swap each round — standings stay meaningful as the
     tournament progresses.
     """
-    order: list[tuple[int, int]] = []
+    order: list[Pairing] = []
     for k in range(games_per_pairing):
         for i in range(n):
             for j in range(i + 1, n):
-                order.append((i, j) if k % 2 == 0 else (j, i))
+                white, black = (i, j) if k % 2 == 0 else (j, i)
+                order.append(Pairing(white, black, k // 2))
     return order
 
 
-def gauntlet_order(n: int, head: int, games_per_pairing: int) -> list[tuple[int, int]]:
-    """(white, black) index pairs for `head` playing every other participant."""
-    order: list[tuple[int, int]] = []
+def gauntlet_order(n: int, head: int, games_per_pairing: int) -> list[Pairing]:
+    """Pairings for `head` playing every other participant."""
+    order: list[Pairing] = []
     for k in range(games_per_pairing):
         for j in range(n):
             if j == head:
                 continue
-            order.append((head, j) if k % 2 == 0 else (j, head))
+            white, black = (head, j) if k % 2 == 0 else (j, head)
+            order.append(Pairing(white, black, k // 2))
     return order
 
 
@@ -139,6 +160,11 @@ async def create_tournament(user: User, payload: TournamentCreateRequest) -> Tou
     # The runner must be online now; games dispatch onto it immediately.
     runner = runners.get_online(payload.runner_id)
     tc = payload.tc or settings.tc
+    book = await books.resolve(payload.book)
+    # Fixed now and stored, so the tournament's openings are reproducible from
+    # the doc while two tournaments of the same shape still differ.
+    book_seed = random.randrange(2**31)
+    lines = books.order(book, book_seed) if book is not None else []
 
     # Resolve each entry's engine + chosen version (or its latest). A participant
     # is a distinct (engine, version) pair, so the same engine may enter at two
@@ -196,6 +222,8 @@ async def create_tournament(user: User, payload: TournamentCreateRequest) -> Tou
         gauntlet_head_version_id=(
             participants[head].version_id if head is not None else None
         ),
+        book=book.slug if book is not None else None,
+        book_seed=book_seed,
         participants=participants,
     )
     await tour.insert()
@@ -206,16 +234,20 @@ async def create_tournament(user: User, payload: TournamentCreateRequest) -> Tou
     await Game.insert_many(
         [
             games.build_game(
-                engines_ordered[white_i],
-                engines_ordered[black_i],
-                versions_ordered[white_i],
-                versions_ordered[black_i],
+                engines_ordered[pairing.white],
+                engines_ordered[pairing.black],
+                versions_ordered[pairing.white],
+                versions_ordered[pairing.black],
                 tc=tc,
                 runner_id=runner.runner_id,
                 tournament_id=tour.id,
                 tournament_seq=seq,
+                book=tour.book,
+                # Wraps: a tournament may play more rounds than the book has
+                # lines, and re-using a line is far better than running out.
+                opening_moves=(lines[pairing.opening % len(lines)] if lines else []),
             )
-            for seq, (white_i, black_i) in enumerate(order)
+            for seq, pairing in enumerate(order)
         ]
     )
 
@@ -579,6 +611,9 @@ async def tournament_detail(tournament_id: UUID) -> TournamentDetailOut:
     tour = await get_tournament(tournament_id)
     counts = await _outcome_counts(tour.id)
     progress = compute_progress(counts)
+    # A book the tournament played but that has since been removed leaves the
+    # slug on the page without a display name; the games keep their lines.
+    book = await Book.find_one(Book.slug == tour.book) if tour.book else None
     live = (
         await Game.find(
             Game.tournament_id == tour.id, Game.status == GameStatus.PLAYING
@@ -605,6 +640,8 @@ async def tournament_detail(tournament_id: UUID) -> TournamentDetailOut:
         tc=tour.tc,
         games_per_pairing=tour.games_per_pairing,
         gauntlet_head_version_id=tour.gauntlet_head_version_id,
+        book=tour.book,
+        book_name=book.name if book is not None else None,
         participants=[
             TournamentParticipantOut.model_validate(p) for p in tour.participants
         ],

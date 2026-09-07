@@ -8,12 +8,13 @@ reserves a runner slot and sends the start command.
 """
 
 import logging
+import random
 import re
 from uuid import UUID
 
 from machineplay import schemas
 
-from app import runners, streaming
+from app import books, runners, streaming
 from app.config import settings
 from app.exceptions import ConflictError, NotFoundError, RunnerBusyError
 from app.models import Engine, EngineVersion, Game, User
@@ -76,8 +77,11 @@ def build_game(
     runner_id: UUID | None = None,
     tournament_id: UUID | None = None,
     tournament_seq: int | None = None,
+    book: str | None = None,
+    opening_moves: list[str] | None = None,
 ) -> Game:
-    """An unsaved PENDING Game doc with everything pinned (engines, versions, tc).
+    """An unsaved PENDING Game doc with everything pinned (engines, versions,
+    tc, opening).
 
     Separate from `create_game` so a tournament can build its whole pairing
     schedule and insert it in one batch rather than a round trip per game.
@@ -96,6 +100,8 @@ def build_game(
         runner_id=runner_id,
         tournament_id=tournament_id,
         tournament_seq=tournament_seq,
+        book=book,
+        opening_moves=opening_moves or [],
         tc=tc,
     )
 
@@ -107,13 +113,25 @@ async def create_game(
     black_version: EngineVersion,
     tc: str,
     runner_id: UUID | None = None,
+    book: str | None = None,
+    opening_moves: list[str] | None = None,
 ) -> Game:
-    """Insert a Game doc with everything pinned (engines, exact versions, tc).
+    """Insert a Game doc with everything pinned (engines, exact versions, tc,
+    opening).
 
     The game is inserted PENDING (not scheduled yet); pass it to `schedule_game`
     to reserve a runner slot and flip it to PLAYING.
     """
-    doc = build_game(white, black, white_version, black_version, tc, runner_id)
+    doc = build_game(
+        white,
+        black,
+        white_version,
+        black_version,
+        tc,
+        runner_id,
+        book=book,
+        opening_moves=opening_moves,
+    )
     await doc.insert()
     return doc
 
@@ -134,6 +152,7 @@ def _start_command(
             digest=black_version.image_digest,
         ),
         tc=doc.tc or settings.tc,
+        opening=list(doc.opening_moves),
     )
 
 
@@ -201,6 +220,11 @@ async def start_game(user: User, payload: StartGameRequest) -> StartGameResponse
     black_version = await _resolve_version(black, payload.black_version_id)
 
     runner = runners.get_online(payload.runner_id)
+    # A one-off game gets a line at random rather than by index: there is no
+    # colour-reversed twin to pair it with, only the wish not to replay the
+    # same game every time two deterministic engines meet.
+    book = await books.resolve(payload.book)
+    opening = random.choice(book.lines) if book is not None and book.lines else []
     doc = await create_game(
         white,
         black,
@@ -208,6 +232,8 @@ async def start_game(user: User, payload: StartGameRequest) -> StartGameResponse
         black_version,
         tc=payload.tc or settings.tc,
         runner_id=runner.runner_id,
+        book=book.slug if book is not None else None,
+        opening_moves=opening,
     )
     try:
         await schedule_game(doc, runner, white_version, black_version)

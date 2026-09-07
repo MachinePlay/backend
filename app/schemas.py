@@ -3,6 +3,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from app import books
 from app.models import TournamentFormat, TournamentStatus
 from machineplay.schemas import (
     GameStatus,
@@ -24,6 +25,10 @@ class StartGameRequest(BaseModel):
     # Time control "base+inc" in seconds (e.g. "30+0.3"); defaults to the
     # server-wide setting.
     tc: str | None = None
+    # Opening book to deal this game's starting line from, by slug. "none"
+    # plays from the initial position — which, between two deterministic
+    # engines, is the same game every time.
+    book: str = books.DEFAULT_SLUG
 
 
 class StartGameResponse(BaseModel):
@@ -209,6 +214,11 @@ class GameOut(BaseModel):
     tc: str | None = None
     runner_id: UUID | None = None
     tournament_id: UUID | None = None
+    # The opening book this game was dealt from, and how many leading `moves`
+    # came out of it rather than from an engine. Zero for a game that started
+    # from the initial position.
+    book: str | None = None
+    book_plies: int = 0
     created_at: datetime
     ended_at: datetime | None
 
@@ -260,6 +270,22 @@ class TournamentCreateRequest(BaseModel):
     runner_id: UUID
     # Time control "base+inc"; defaults to the server-wide setting.
     tc: str | None = None
+    # Opening book every pairing is dealt from, by slug. "none" plays every
+    # game from the initial position, which between deterministic engines makes
+    # the whole tournament one game per colour assignment.
+    book: str = books.DEFAULT_SLUG
+
+
+class BookOut(BaseModel):
+    """One opening book in the catalog. `lines` is a count, not the lines
+    themselves: the browser only needs to name and size the choice."""
+
+    slug: str
+    name: str
+    description: str
+    source: str
+    plies: int
+    lines: int
 
 
 class TournamentParticipantOut(BaseModel):
@@ -360,6 +386,10 @@ class TournamentDetailOut(BaseModel):
     tc: str
     games_per_pairing: int
     gauntlet_head_version_id: UUID | None
+    # The book pairings were dealt from, by slug, with its display name
+    # resolved; both None when the tournament plays from the initial position.
+    book: str | None = None
+    book_name: str | None = None
     participants: list[TournamentParticipantOut]
     standings: list[StandingRow]
     progress: TournamentProgress

@@ -8,7 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.routing import APIRoute
 from starlette.middleware.sessions import SessionMiddleware
 
-from app import db, streaming
+from app import books, db, streaming
 from app.config import settings
 from app.exceptions import AppException
 from app.routes import router
@@ -24,6 +24,7 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     client = await db.connect()
+    await books.seed()
     await streaming.abort_orphan_games()
     try:
         yield
@@ -78,6 +79,11 @@ TAGS_METADATA = [
         "name": "Tournaments",
         "description": "Round-robin and gauntlet tournaments: create one on a "
         "runner and watch its pairings play out with live standings.",
+    },
+    {
+        "name": "Opening books",
+        "description": "The opening lines games are dealt to start from, so "
+        "two deterministic engines don't replay one game all tournament.",
     },
     {
         "name": "Live streaming",

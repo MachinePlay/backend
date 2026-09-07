@@ -3,7 +3,7 @@ from uuid import uuid4
 from httpx import ASGITransport, AsyncClient
 from machineplay import schemas as ws_schemas
 
-from app import games, runners, streaming
+from app import books, games, runners, streaming
 from app.auth import mint_token
 from app.main import app
 from app.models import Engine, EngineVersion, Game, Runner, User
@@ -230,3 +230,76 @@ async def test_cancel_game_aborts_and_tells_runner() -> None:
             assert resp.status_code == 409
     finally:
         runners.mark_offline(conn)
+
+
+async def test_start_game_deals_an_opening_and_sends_it_to_the_runner() -> None:
+    """A one-off game gets a book line too: two deterministic engines from the
+    initial position play the same game every time."""
+    headers, user, engine, _ = await _setup()
+    conn = await _online_runner(user, max_games=1)
+    doc = None
+    try:
+        async with _client() as client:
+            resp = await client.post(
+                "/game",
+                headers=headers,
+                json={
+                    "white_engine_id": str(engine.id),
+                    "black_engine_id": str(engine.id),
+                    "runner_id": str(conn.runner_id),
+                },
+            )
+        assert resp.status_code == 200
+        doc = await Game.get(resp.json()["id"])
+        assert doc is not None
+        assert doc.book == books.DEFAULT_SLUG
+        assert len(doc.opening_moves) == books.PLIES
+        assert doc.book_plies == books.PLIES
+
+        # The runner is handed the line itself — no book file ever reaches it.
+        cmd = conn.scheduled_commands.get_nowait()
+        assert isinstance(cmd, ws_schemas.StartGame)
+        assert cmd.opening == doc.opening_moves
+    finally:
+        if doc is not None:
+            streaming.game_registry.unregister(doc.id)
+            conn.untrack_game(doc.id)
+        runners.mark_offline(conn)
+
+
+async def test_start_game_without_a_book() -> None:
+    headers, user, engine, _ = await _setup()
+    conn = await _online_runner(user, max_games=1)
+    doc = None
+    try:
+        async with _client() as client:
+            resp = await client.post(
+                "/game",
+                headers=headers,
+                json={
+                    "white_engine_id": str(engine.id),
+                    "black_engine_id": str(engine.id),
+                    "runner_id": str(conn.runner_id),
+                    "book": books.NO_BOOK,
+                },
+            )
+        assert resp.status_code == 200
+        doc = await Game.get(resp.json()["id"])
+        assert doc is not None
+        assert doc.book is None and doc.opening_moves == []
+    finally:
+        if doc is not None:
+            streaming.game_registry.unregister(doc.id)
+            conn.untrack_game(doc.id)
+        runners.mark_offline(conn)
+
+
+async def test_list_books_endpoint() -> None:
+    async with _client() as client:
+        resp = await client.get("/book")
+    assert resp.status_code == 200
+    rows = resp.json()
+    assert [r["slug"] for r in rows] == [books.DEFAULT_SLUG]
+    # A count, not the lines themselves.
+    assert rows[0]["lines"] > 100
+    assert rows[0]["plies"] == books.PLIES

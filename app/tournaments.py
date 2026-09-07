@@ -17,6 +17,8 @@ Two hooks drive it:
 
 import asyncio
 import logging
+from collections import Counter
+from typing import NamedTuple
 from uuid import UUID
 
 from machineplay.schemas import GameEndEvent, GameStatus, StopGame
@@ -33,6 +35,7 @@ from app.models import (
     Engine,
     EngineVersion,
     Game,
+    Runner,
     Tournament,
     TournamentFormat,
     TournamentParticipant,
@@ -46,15 +49,30 @@ from app.schemas import (
     StandingRow,
     TournamentCreateRequest,
     TournamentDetailOut,
+    TournamentGameRow,
+    TournamentGamesOut,
     TournamentOut,
     TournamentParticipantOut,
+    TournamentProgress,
 )
 
 logger = logging.getLogger(__name__)
 
-# N*(N-1)/2 pairings * games_per_pairing grows fast; keep tournaments bounded.
 MAX_PARTICIPANTS = 8
-MAX_GAMES_PER_PAIRING = 20
+
+# The cap that matters is the tournament's *total* games, not its per-pairing
+# count: a round robin has N*(N-1)/2 pairings, so the same "games per pairing"
+# means 500 games for a two-engine match and 14000 for eight players. 2000 is
+# where a match stops being cheap — a finished game doc runs to ~100KB — and is
+# also about where the elo error bars stop shrinking usefully (~±13 elo).
+MAX_GAMES_PER_TOURNAMENT = 2000
+
+# Rough per-game wallclock for the ETA. Engines at a fixed time control spend
+# most of their budget, so a game costs about both sides' allowance over an
+# assumed 40 moves each, plus docker/fastchess startup. Deliberately crude: the
+# point is to tell "20 minutes" from "two days" before the tournament starts.
+ETA_MOVES_PER_SIDE = 40
+ETA_STARTUP_SECONDS = 10.0
 
 # Aborts a tournament game can recover from by re-queueing it: the game never
 # got a fair result because the infrastructure went away, not the engine. Engine
@@ -103,10 +121,8 @@ async def create_tournament(user: User, payload: TournamentCreateRequest) -> Tou
         raise ConflictError("tournament name is required")
     if not games.TC_RE.fullmatch(payload.tc or settings.tc):
         raise ConflictError("invalid time control (expected 'base+inc')")
-    if not 1 <= payload.games_per_pairing <= MAX_GAMES_PER_PAIRING:
-        raise ConflictError(
-            f"games_per_pairing must be between 1 and {MAX_GAMES_PER_PAIRING}"
-        )
+    if payload.games_per_pairing < 1:
+        raise ConflictError("games_per_pairing must be at least 1")
 
     n = len(payload.entries)
     if n < 2:
@@ -160,6 +176,13 @@ async def create_tournament(user: User, payload: TournamentCreateRequest) -> Tou
     else:
         order = round_robin_order(n, payload.games_per_pairing)
 
+    if len(order) > MAX_GAMES_PER_TOURNAMENT:
+        raise ConflictError(
+            f"{len(order)} games is over the {MAX_GAMES_PER_TOURNAMENT} per "
+            f"tournament limit ({len(order) // payload.games_per_pairing} "
+            f"pairings x {payload.games_per_pairing} games)"
+        )
+
     tour = Tournament(
         name=name,
         creator_id=user.id,
@@ -177,16 +200,24 @@ async def create_tournament(user: User, payload: TournamentCreateRequest) -> Tou
     )
     await tour.insert()
 
-    for white_i, black_i in order:
-        await games.create_game(
-            engines_ordered[white_i],
-            engines_ordered[black_i],
-            versions_ordered[white_i],
-            versions_ordered[black_i],
-            tc=tc,
-            runner_id=runner.runner_id,
-            tournament_id=tour.id,
-        )
+    # One insert for the whole schedule: 2000 individual round trips would keep
+    # the POST open for seconds. `tournament_seq` carries the order, since the
+    # batch shares a `created_at`.
+    await Game.insert_many(
+        [
+            games.build_game(
+                engines_ordered[white_i],
+                engines_ordered[black_i],
+                versions_ordered[white_i],
+                versions_ordered[black_i],
+                tc=tc,
+                runner_id=runner.runner_id,
+                tournament_id=tour.id,
+                tournament_seq=seq,
+            )
+            for seq, (white_i, black_i) in enumerate(order)
+        ]
+    )
 
     logger.info(
         "created tournament=%s %s %d players %d games by %s on runner=%s",
@@ -226,29 +257,47 @@ async def _requeue(doc: Game) -> None:
     await doc.save()
 
 
-async def _dispatch_pending(conn: RunnerConnection, tour: Tournament) -> None:
-    """Schedule this tournament's PENDING games onto `conn` until it's full."""
-    pending = (
+async def _next_pending(tour: Tournament, limit: int) -> list[Game]:
+    """The next `limit` pairings due to play, in schedule order.
+
+    Ordered by `tournament_seq` so the round-interleaved pairing order is what
+    actually gets played; `created_at` breaks ties for games inserted before
+    that field existed. Limited because a tournament can have thousands pending
+    and this runs on every game finish.
+    """
+    return (
         await Game.find(
             Game.tournament_id == tour.id, Game.status == GameStatus.PENDING
         )
-        .sort("+created_at")
+        .sort("+tournament_seq", "+created_at")
+        .limit(limit)
         .to_list()
     )
-    for doc in pending:
-        if conn.is_full():
-            break
-        wv = await EngineVersion.get(doc.white_version_id)
-        bv = await EngineVersion.get(doc.black_version_id)
-        if wv is None or bv is None:
-            await _mark_aborted(doc, "engine version missing")
-            continue
-        try:
-            await games.schedule_game(doc, conn, wv, bv)
-        except (RunnerBusyError, NotFoundError):
-            # Full (raced) or the runner went offline mid-loop: stop; the next
-            # finish/reconnect picks up where this left off.
-            break
+
+
+async def _dispatch_pending(conn: RunnerConnection, tour: Tournament) -> None:
+    """Schedule this tournament's PENDING games onto `conn` until it's full."""
+    while not conn.is_full():
+        pending = await _next_pending(tour, conn.max_games - conn.active_games)
+        if not pending:
+            return
+        for doc in pending:
+            if conn.is_full():
+                break
+            wv = await EngineVersion.get(doc.white_version_id)
+            bv = await EngineVersion.get(doc.black_version_id)
+            if wv is None or bv is None:
+                await _mark_aborted(doc, "engine version missing")
+                continue
+            try:
+                await games.schedule_game(doc, conn, wv, bv)
+            except (RunnerBusyError, NotFoundError):
+                # Full (raced) or the runner went offline mid-loop: stop; the
+                # next finish/reconnect picks up where this left off.
+                return
+        # Loop rather than return: a page that was all unplayable (missing
+        # image) aborted its games without filling a slot, so the next page is
+        # still owed one. Terminates — each pass either schedules or aborts.
 
 
 async def _dispatch_runner(runner_id: UUID) -> None:
@@ -376,7 +425,69 @@ async def get_tournament(tournament_id: UUID) -> Tournament:
     return tour
 
 
-def compute_standings(tour: Tournament, tourney_games: list[Game]) -> list[StandingRow]:
+class OutcomeCount(NamedTuple):
+    """How many of a tournament's games share one (status, pairing, result).
+
+    The unit the standings/progress aggregate returns: at most a few per
+    pairing, so a 2000-game tournament summarises into a handful of rows
+    instead of 2000 documents on the wire.
+    """
+
+    status: str
+    white_version_id: UUID | None
+    black_version_id: UUID | None
+    result: str | None
+    # Named `game_count`, not `count`: NamedTuple inherits `tuple.count`.
+    game_count: int
+
+
+async def _outcome_counts(tournament_id: UUID) -> list[OutcomeCount]:
+    """Group the tournament's games by status, pairing and result, in Mongo."""
+    rows = await Game.aggregate(
+        [
+            {"$match": {"tournament_id": tournament_id}},
+            {
+                "$group": {
+                    "_id": {
+                        "status": "$status",
+                        "white": "$white_version_id",
+                        "black": "$black_version_id",
+                        "result": "$result",
+                    },
+                    "count": {"$sum": 1},
+                }
+            },
+        ]
+    ).to_list()
+    return [
+        OutcomeCount(
+            status=row["_id"]["status"],
+            white_version_id=row["_id"].get("white"),
+            black_version_id=row["_id"].get("black"),
+            result=row["_id"].get("result"),
+            game_count=row["count"],
+        )
+        for row in rows
+    ]
+
+
+def compute_progress(counts: list[OutcomeCount]) -> TournamentProgress:
+    """Per-status game counts for the tournament, from the grouped rows."""
+    by_status: Counter[str] = Counter()
+    for row in counts:
+        by_status[row.status] += row.game_count
+    return TournamentProgress(
+        total=sum(by_status.values()),
+        pending=by_status[GameStatus.PENDING],
+        playing=by_status[GameStatus.PLAYING],
+        ended=by_status[GameStatus.ENDED],
+        aborted=by_status[GameStatus.ABORTED],
+    )
+
+
+def compute_standings(
+    tour: Tournament, counts: list[OutcomeCount]
+) -> list[StandingRow]:
     """W=1 / D=0.5 / L=0 over ENDED games, sorted by score then wins then name.
 
     Keyed by version id: a participant is an (engine, version) pair, so two
@@ -387,21 +498,21 @@ def compute_standings(tour: Tournament, tourney_games: list[Game]) -> list[Stand
     draws: dict[UUID, int] = {vid: 0 for vid in parts}
     losses: dict[UUID, int] = {vid: 0 for vid in parts}
 
-    for g in tourney_games:
-        if g.status != GameStatus.ENDED:
+    for row in counts:
+        if row.status != GameStatus.ENDED:
             continue
-        w, b = g.white_version_id, g.black_version_id
+        w, b = row.white_version_id, row.black_version_id
         if w not in parts or b not in parts:
             continue
-        if g.result == "1-0":
-            wins[w] += 1
-            losses[b] += 1
-        elif g.result == "0-1":
-            wins[b] += 1
-            losses[w] += 1
-        elif g.result == "1/2-1/2":
-            draws[w] += 1
-            draws[b] += 1
+        if row.result == "1-0":
+            wins[w] += row.game_count
+            losses[b] += row.game_count
+        elif row.result == "0-1":
+            wins[b] += row.game_count
+            losses[w] += row.game_count
+        elif row.result == "1/2-1/2":
+            draws[w] += row.game_count
+            draws[b] += row.game_count
 
     rows = [
         StandingRow(
@@ -421,10 +532,68 @@ def compute_standings(tour: Tournament, tourney_games: list[Game]) -> list[Stand
     return rows
 
 
+# --- ETA ---------------------------------------------------------------------
+
+
+def estimate_game_seconds(tc: str) -> float:
+    """Roughly how long one game at time control `tc` takes, wallclock.
+
+    Engines at a fixed time control spend most of their allowance, so a game
+    costs about both sides' budget over `ETA_MOVES_PER_SIDE` moves, plus image
+    pull/startup. Mirrored in the frontend (`src/tc.ts`) for the create form,
+    which needs the estimate before the tournament exists.
+    """
+    base, _, inc = tc.partition("+")
+    seconds = 2 * (float(base) + ETA_MOVES_PER_SIDE * float(inc or 0))
+    return seconds + ETA_STARTUP_SECONDS
+
+
+def estimate_remaining_seconds(tc: str, unplayed: int, max_games: int) -> float | None:
+    """Wallclock left for `unplayed` games sharing `max_games` runner slots."""
+    if unplayed <= 0 or max_games <= 0:
+        return None
+    return unplayed * estimate_game_seconds(tc) / max_games
+
+
+async def _runner_slots(runner_id: UUID) -> int:
+    """The runner's game capacity: live if it is connected, else last reported."""
+    conn = runners.find_online(runner_id)
+    if conn is not None:
+        return conn.max_games
+    doc = await Runner.get(runner_id)
+    return doc.max_games if doc is not None else 0
+
+
+# --- serialization -----------------------------------------------------------
+
+
 async def tournament_detail(tournament_id: UUID) -> TournamentDetailOut:
+    """Everything the tournament page shows except the pairings list.
+
+    Standings and progress come from one grouped aggregate and the live boards
+    from the handful of PLAYING games, so the response size is set by the
+    participant and runner-slot counts rather than by how many games the
+    tournament runs. The pairings themselves are paged in via
+    `tournament_games`.
+    """
     tour = await get_tournament(tournament_id)
-    tourney_games = (
-        await Game.find(Game.tournament_id == tour.id).sort("+created_at").to_list()
+    counts = await _outcome_counts(tour.id)
+    progress = compute_progress(counts)
+    live = (
+        await Game.find(
+            Game.tournament_id == tour.id, Game.status == GameStatus.PLAYING
+        )
+        .sort("+tournament_seq", "+created_at")
+        .to_list()
+    )
+    eta = (
+        estimate_remaining_seconds(
+            tour.tc,
+            progress.pending + progress.playing,
+            await _runner_slots(tour.runner_id),
+        )
+        if tour.status == TournamentStatus.RUNNING
+        else None
     )
     return TournamentDetailOut(
         id=tour.id,
@@ -439,10 +608,37 @@ async def tournament_detail(tournament_id: UUID) -> TournamentDetailOut:
         participants=[
             TournamentParticipantOut.model_validate(p) for p in tour.participants
         ],
-        standings=compute_standings(tour, tourney_games),
-        games=[GameOut.model_validate(g) for g in tourney_games],
+        standings=compute_standings(tour, counts),
+        progress=progress,
+        live_games=[GameOut.model_validate(g) for g in live],
+        eta_seconds=eta,
         created_at=tour.created_at,
         ended_at=tour.ended_at,
+    )
+
+
+async def tournament_games(
+    tournament_id: UUID,
+    status: GameStatus | None,
+    limit: int,
+    offset: int,
+) -> TournamentGamesOut:
+    """One page of the pairings list, in schedule order, optionally by status."""
+    await get_tournament(tournament_id)
+    query: dict[str, object] = {"tournament_id": tournament_id}
+    if status is not None:
+        query["status"] = status
+    total = await Game.find(query).count()
+    docs = (
+        await Game.find(query)
+        .sort("+tournament_seq", "+created_at")
+        .skip(offset)
+        .limit(limit)
+        .to_list()
+    )
+    return TournamentGamesOut(
+        games=[TournamentGameRow.model_validate(g) for g in docs],
+        total=total,
     )
 
 

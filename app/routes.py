@@ -52,6 +52,7 @@ from app.schemas import (
     TokenOut,
     TournamentCreateRequest,
     TournamentDetailOut,
+    TournamentGamesOut,
     TournamentOut,
     UserOut,
     UserProfileOut,
@@ -326,6 +327,23 @@ async def list_tournaments(
 async def get_tournament(tournament_id: UUID) -> TournamentDetailOut:
     """Tournament detail: participants, computed standings, and its games."""
     return await tournaments.tournament_detail(tournament_id)
+
+
+@tournaments_router.get(
+    "/tournament/{tournament_id}/games", response_model=TournamentGamesOut
+)
+async def get_tournament_games(
+    tournament_id: UUID,
+    status: schemas.GameStatus | None = None,
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+) -> TournamentGamesOut:
+    """A page of the tournament's pairings, in schedule order.
+
+    Paged and stripped of moves/pgn: a tournament runs to thousands of games
+    and the page polls this while it is running.
+    """
+    return await tournaments.tournament_games(tournament_id, status, limit, offset)
 
 
 @tournaments_router.post("/tournament/{tournament_id}/cancel")

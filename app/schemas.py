@@ -304,6 +304,52 @@ class TournamentOut(BaseModel):
     ended_at: datetime | None = None
 
 
+class TournamentGameRow(BaseModel):
+    """One pairing in the tournament's game list.
+
+    Deliberately narrower than `GameOut`: no moves, pgn or fen. A tournament
+    runs to thousands of games and the page polls while it is running, so the
+    list carries only what a row renders. The live boards (`live_games`, capped
+    by the runner's slot count) still get the full `GameOut`.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    white_name: str
+    black_name: str
+    white_version: str
+    black_version: str
+    white_version_id: UUID | None = None
+    black_version_id: UUID | None = None
+    status: GameStatus
+    result: str | None
+    reason: str | None = None
+    created_at: datetime
+    ended_at: datetime | None
+
+
+class TournamentGamesOut(BaseModel):
+    """A page of the pairings list, plus how many match the status filter."""
+
+    games: list[TournamentGameRow]
+    total: int
+
+
+class TournamentProgress(BaseModel):
+    """How many of the tournament's games sit in each state.
+
+    Counted with one aggregate rather than by loading the games, so the page
+    stays cheap however many pairings there are.
+    """
+
+    total: int
+    pending: int
+    playing: int
+    ended: int
+    aborted: int
+
+
 class TournamentDetailOut(BaseModel):
     id: UUID
     name: str
@@ -316,6 +362,12 @@ class TournamentDetailOut(BaseModel):
     gauntlet_head_version_id: UUID | None
     participants: list[TournamentParticipantOut]
     standings: list[StandingRow]
-    games: list[GameOut]
+    progress: TournamentProgress
+    # The games playing right now — what the live boards render. Bounded by the
+    # runner's `max_games`, so this stays small however big the tournament is.
+    live_games: list[GameOut]
+    # Rough wallclock left, from the time control and the runner's slot count;
+    # None once nothing is left to play. An estimate, not a promise.
+    eta_seconds: float | None = None
     created_at: datetime
     ended_at: datetime | None = None

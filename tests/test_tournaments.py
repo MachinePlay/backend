@@ -415,7 +415,9 @@ async def test_standings_score_and_order() -> None:
         )
         # Both games dispatched (capacity 2). game0: e1 white; game1: e2 white.
         games_docs = (
-            await Game.find(Game.tournament_id == tour.id).sort("+created_at").to_list()
+            await Game.find(Game.tournament_id == tour.id)
+            .sort("+tournament_seq")
+            .to_list()
         )
         assert games_docs[0].white_id == e1.id
         # e1 wins both: white win in game0, black win (e1 is black) in game1.
@@ -551,3 +553,153 @@ async def test_deleting_an_entered_version_keeps_tournament_history(
     ]
     assert {row.engine_name for row in detail.standings} == {"a", "b"}
     assert sum(row.played for row in detail.standings) == 4
+
+
+# --- limits, ordering and paging ---------------------------------------------
+
+
+def test_estimate_scales_with_base_and_increment() -> None:
+    # Both sides' budget over ETA_MOVES_PER_SIDE moves, plus startup.
+    assert tournaments.estimate_game_seconds("30+0.3") == 2 * (30 + 40 * 0.3) + 10
+    # An increment-less control is still accepted.
+    assert tournaments.estimate_game_seconds("60") == 2 * 60 + 10
+    # More slots finish the same work proportionally sooner.
+    one = tournaments.estimate_remaining_seconds("10+0.1", 100, 1)
+    four = tournaments.estimate_remaining_seconds("10+0.1", 100, 4)
+    assert one is not None and four is not None
+    assert one == pytest.approx(four * 4)
+    # Nothing left to play has no ETA.
+    assert tournaments.estimate_remaining_seconds("10+0.1", 0, 4) is None
+
+
+async def test_rejects_more_games_than_the_tournament_cap() -> None:
+    user = await User(github_id=20, login="ivy").insert()
+    engines_ = [await _engine(user, n) for n in ("a", "b", "c", "d")]
+    conn = await _online_runner(user, max_games=1)
+    try:
+        # 6 pairings * 400 games = 2400, over the 2000 cap — even though no
+        # single pairing plays an outrageous number.
+        with pytest.raises(ConflictError) as exc:
+            await tournaments.create_tournament(
+                user,
+                TournamentCreateRequest(
+                    name="too big",
+                    format=TournamentFormat.ROUND_ROBIN,
+                    entries=_entries(*engines_),
+                    games_per_pairing=400,
+                    runner_id=conn.runner_id,
+                ),
+            )
+        assert "2000" in str(exc.value)
+        # Nothing was inserted.
+        assert await Tournament.find(Tournament.creator_id == user.id).count() == 0
+    finally:
+        _cleanup(conn)
+
+
+async def test_allows_a_long_head_to_head_match() -> None:
+    """The per-pairing count is only capped by the tournament total: a two-engine
+    match may play far more games than a round robin's pairings could."""
+    user = await User(github_id=21, login="jo").insert()
+    e1 = await _engine(user, "a")
+    e2 = await _engine(user, "b")
+    conn = await _online_runner(user, max_games=1)
+    try:
+        tour = await tournaments.create_tournament(
+            user,
+            TournamentCreateRequest(
+                name="match",
+                format=TournamentFormat.ROUND_ROBIN,
+                entries=_entries(e1, e2),
+                games_per_pairing=500,
+                runner_id=conn.runner_id,
+                tc="10+0.1",
+            ),
+        )
+        assert await Game.find(Game.tournament_id == tour.id).count() == 500
+        # The batch shares a created_at, so seq is what orders them: it must be
+        # dense and gap-free or dispatch would skip pairings.
+        seqs = [
+            g.tournament_seq
+            for g in await Game.find(Game.tournament_id == tour.id)
+            .sort("+tournament_seq")
+            .to_list()
+        ]
+        assert seqs == list(range(500))
+
+        detail = await tournaments.tournament_detail(tour.id)
+        assert detail.progress.total == 500
+        assert detail.progress.playing == 1
+        assert detail.progress.pending == 499
+        # 500 games, one slot: the ETA is the whole match end to end.
+        assert detail.eta_seconds == pytest.approx(
+            500 * tournaments.estimate_game_seconds("10+0.1")
+        )
+    finally:
+        _cleanup(conn)
+
+
+async def test_detail_carries_live_boards_not_the_whole_schedule() -> None:
+    user = await User(github_id=22, login="kim").insert()
+    e1 = await _engine(user, "a")
+    e2 = await _engine(user, "b")
+    conn = await _online_runner(user, max_games=2)
+    try:
+        tour = await tournaments.create_tournament(
+            user,
+            TournamentCreateRequest(
+                name="live",
+                format=TournamentFormat.ROUND_ROBIN,
+                entries=_entries(e1, e2),
+                games_per_pairing=10,
+                runner_id=conn.runner_id,
+            ),
+        )
+        detail = await tournaments.tournament_detail(tour.id)
+        # Only the games actually playing ride along, however big the schedule.
+        assert len(detail.live_games) == 2
+        assert detail.progress.total == 10
+        assert {g.status for g in detail.live_games} == {GameStatus.PLAYING}
+    finally:
+        _cleanup(conn)
+
+
+async def test_games_page_is_ordered_filtered_and_bounded() -> None:
+    user = await User(github_id=23, login="lee").insert()
+    e1 = await _engine(user, "a")
+    e2 = await _engine(user, "b")
+    conn = await _online_runner(user, max_games=1)
+    try:
+        tour = await tournaments.create_tournament(
+            user,
+            TournamentCreateRequest(
+                name="paged",
+                format=TournamentFormat.ROUND_ROBIN,
+                entries=_entries(e1, e2),
+                games_per_pairing=6,
+                runner_id=conn.runner_id,
+            ),
+        )
+        first = await tournaments.tournament_games(tour.id, None, limit=4, offset=0)
+        assert first.total == 6
+        assert len(first.games) == 4
+        second = await tournaments.tournament_games(tour.id, None, limit=4, offset=4)
+        assert len(second.games) == 2
+        # Paging walks the schedule in order, without repeats.
+        ids = [g.id for g in first.games] + [g.id for g in second.games]
+        assert len(set(ids)) == 6
+        ordered = (
+            await Game.find(Game.tournament_id == tour.id)
+            .sort("+tournament_seq")
+            .to_list()
+        )
+        assert ids == [g.id for g in ordered]
+
+        # Filtering by status counts only the matching games.
+        playing = await tournaments.tournament_games(
+            tour.id, GameStatus.PLAYING, limit=50, offset=0
+        )
+        assert playing.total == 1
+        assert playing.games[0].status == GameStatus.PLAYING
+    finally:
+        _cleanup(conn)

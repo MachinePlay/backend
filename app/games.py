@@ -67,7 +67,7 @@ async def _resolve_version(engine: Engine, version_id: UUID | None) -> EngineVer
     return version
 
 
-async def create_game(
+def build_game(
     white: Engine,
     black: Engine,
     white_version: EngineVersion,
@@ -75,15 +75,16 @@ async def create_game(
     tc: str,
     runner_id: UUID | None = None,
     tournament_id: UUID | None = None,
+    tournament_seq: int | None = None,
 ) -> Game:
-    """Insert a Game doc with everything pinned (engines, exact versions, tc).
+    """An unsaved PENDING Game doc with everything pinned (engines, versions, tc).
 
-    The game is inserted PENDING (not scheduled yet); pass it to `schedule_game`
-    to reserve a runner slot and flip it to PLAYING.
+    Separate from `create_game` so a tournament can build its whole pairing
+    schedule and insert it in one batch rather than a round trip per game.
     """
     if not TC_RE.fullmatch(tc):
         raise ConflictError(f"invalid time control {tc!r} (expected 'base+inc')")
-    doc = Game(
+    return Game(
         white=white,
         black=black,
         white_name=white.name,
@@ -94,8 +95,25 @@ async def create_game(
         black_version_id=black_version.id,
         runner_id=runner_id,
         tournament_id=tournament_id,
+        tournament_seq=tournament_seq,
         tc=tc,
     )
+
+
+async def create_game(
+    white: Engine,
+    black: Engine,
+    white_version: EngineVersion,
+    black_version: EngineVersion,
+    tc: str,
+    runner_id: UUID | None = None,
+) -> Game:
+    """Insert a Game doc with everything pinned (engines, exact versions, tc).
+
+    The game is inserted PENDING (not scheduled yet); pass it to `schedule_game`
+    to reserve a runner slot and flip it to PLAYING.
+    """
+    doc = build_game(white, black, white_version, black_version, tc, runner_id)
     await doc.insert()
     return doc
 

@@ -111,8 +111,13 @@ class Game(UUIDDocument):
     # The runner this game was scheduled on and the time control it played.
     runner_id: UUID | None = None
     tc: str | None = None
-    # Set when the game belongs to a tournament (M8).
+    # Set when the game belongs to a tournament (M8). `tournament_seq` is the
+    # game's index in the tournament's generated pairing order: the pairings are
+    # inserted in one batch and so share a `created_at`, and the order matters
+    # (it is interleaved by round, so standings stay meaningful mid-tournament).
+    # Sorting on it keeps dispatch and the pairings list in schedule order.
     tournament_id: UUID | None = None
+    tournament_seq: int | None = None
     # A freshly-created game is PENDING until a runner slot is reserved for it
     # (schedule_game flips it to PLAYING). Defaulting to PENDING keeps a
     # not-yet-dispatched game from being treated as live or aborted-on-restart.
@@ -149,12 +154,32 @@ class Game(UUIDDocument):
 
     class Settings:
         # white/black indexes back the "games of these engines" queries on
-        # profile and engine pages; tournament_id backs tournament pages (M8).
+        # profile and engine pages. The two tournament indexes back the
+        # tournament page: the first the paginated pairings list, the second
+        # everything that filters by status (dispatching the next PENDING game,
+        # the live boards, the standings/progress aggregate). `created_at` is
+        # the last key in both so games predating `tournament_seq` still sort
+        # deterministically. The first index's `tournament_id` prefix also
+        # serves plain "games of this tournament" lookups.
         indexes = [
             "created_at",
             IndexModel([("white.$id", ASCENDING)]),
             IndexModel([("black.$id", ASCENDING)]),
-            "tournament_id",
+            IndexModel(
+                [
+                    ("tournament_id", ASCENDING),
+                    ("tournament_seq", ASCENDING),
+                    ("created_at", ASCENDING),
+                ]
+            ),
+            IndexModel(
+                [
+                    ("tournament_id", ASCENDING),
+                    ("status", ASCENDING),
+                    ("tournament_seq", ASCENDING),
+                    ("created_at", ASCENDING),
+                ]
+            ),
         ]
 
 

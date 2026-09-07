@@ -61,6 +61,73 @@ async def test_move_event_pushes_san_atomically() -> None:
     assert refreshed.black_clock == 29.4
 
 
+async def test_move_event_keeps_evals_aligned_with_moves() -> None:
+    """`evals[i]` describes `moves[i]`, including when an engine reported
+    nothing scoreable for its move."""
+    g = await _make_game()
+
+    await persist_event(
+        g.id,
+        schemas.MoveEvent(
+            uci="e2e4",
+            san="e4",
+            from_square="e2",
+            to_square="e4",
+            fen="fen-after-e4",
+            ply=1,
+            white_clock=30.0,
+            black_clock=30.0,
+            analysis=schemas.SearchInfo(depth=8, score_cp=31, pv=["e2e4", "e7e5"]),
+        ),
+    )
+    await persist_event(
+        g.id,
+        schemas.MoveEvent(
+            uci="e7e5",
+            san="e5",
+            from_square="e7",
+            to_square="e5",
+            fen="fen-after-e5",
+            ply=2,
+            white_clock=30.0,
+            black_clock=30.0,
+        ),
+    )
+
+    refreshed = await Game.get(g.id)
+    assert refreshed is not None
+    assert refreshed.moves == ["e4", "e5"]
+    assert len(refreshed.evals) == 2
+    assert refreshed.evals[0] is not None
+    assert refreshed.evals[0].depth == 8
+    assert refreshed.evals[0].score_cp == 31
+    assert refreshed.evals[1] is None
+
+
+async def test_live_only_events_are_not_persisted() -> None:
+    """Search chatter never touches the doc — only the move that follows it."""
+    g = await _make_game()
+
+    await persist_event(
+        g.id,
+        schemas.EngineInfoEvent(
+            side="white", ply=0, info=schemas.SearchInfo(depth=3, score_cp=10)
+        ),
+    )
+    await persist_event(
+        g.id,
+        schemas.UciLogEvent(
+            lines=[schemas.UciLine(side="white", sent=True, text="go", ply=0)]
+        ),
+    )
+
+    refreshed = await Game.get(g.id)
+    assert refreshed is not None
+    assert refreshed.moves == []
+    assert refreshed.evals == []
+    assert refreshed.uci_tail == []
+
+
 async def test_game_end_event_sets_status_and_pgn() -> None:
     g = await _make_game()
 

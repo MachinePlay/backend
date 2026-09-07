@@ -4,7 +4,14 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.models import TournamentFormat, TournamentStatus
-from machineplay.schemas import GameStatus, GameStreamEvent, HardwareInfo, Telemetry
+from machineplay.schemas import (
+    GameStatus,
+    GameStreamEvent,
+    HardwareInfo,
+    SearchInfo,
+    Telemetry,
+    UciLine,
+)
 
 
 class StartGameRequest(BaseModel):
@@ -204,6 +211,19 @@ class GameOut(BaseModel):
     tournament_id: UUID | None = None
     created_at: datetime
     ended_at: datetime | None
+
+
+class GameDetailOut(GameOut):
+    """One game's page: everything the list view carries, plus the analysis the
+    engines produced. Both fields are per-ply and can run to hundreds of
+    entries, so they stay out of the list responses."""
+
+    # Parallel to `moves`: what each mover's search reported, for the eval bars
+    # and the analysis view.
+    evals: list[SearchInfo | None] = []
+    # The end of the UCI conversation, kept when the game finished (empty while
+    # it is still being streamed — the SSE stream carries it live).
+    uci_tail: list[UciLine] = []
 
 
 class UserProfileOut(BaseModel):

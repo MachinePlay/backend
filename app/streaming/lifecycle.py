@@ -37,6 +37,12 @@ async def finish_game(game_id: UUID, event: schemas.GameEndEvent) -> None:
     game = game_registry.unregister(game_id)
     await persist_event(game_id, event)
     if game is not None:
+        if game.uci_lines:
+            # The live UCI buffer dies with the stream; keep its tail on the
+            # doc so the debug view still works on a finished game.
+            await GameDoc.find_one(GameDoc.id == game_id).update(
+                {"$set": {"uci_tail": [line.model_dump() for line in game.uci_lines]}}
+            )
         await game.broadcast(event)
     await live_stream.broadcast(game_id, event)
     for hook in _game_finished_hooks:
@@ -83,17 +89,31 @@ async def abort_orphan_games() -> None:
 async def persist_event(game_id: UUID, event: schemas.GameStreamEvent) -> None:
     update: dict[str, dict[str, object]] = {}
     match event:
+        case schemas.EngineInfoEvent() | schemas.UciLogEvent():
+            # Live-only: an in-progress search is superseded by the move that
+            # follows it, and the transcript is kept in memory (its tail is
+            # persisted once, when the game ends).
+            return
         case schemas.GameStartEvent():
             update["$set"] = {"status": GameStatus.PLAYING}
-        case schemas.FenEvent(fen=fen, moves=moves, white_clock=wc, black_clock=bc):
+        case schemas.FenEvent(
+            fen=fen, moves=moves, evals=evals, white_clock=wc, black_clock=bc
+        ):
             update["$set"] = {
                 "fen": fen,
                 "moves": list(moves),
+                "evals": [e.model_dump() if e else None for e in evals],
                 "white_clock": wc,
                 "black_clock": bc,
             }
-        case schemas.MoveEvent(san=san, fen=fen, white_clock=wc, black_clock=bc):
-            update["$push"] = {"moves": san}
+        case schemas.MoveEvent(
+            san=san, fen=fen, analysis=analysis, white_clock=wc, black_clock=bc
+        ):
+            # `evals` stays index-aligned with `moves`, so both are pushed here.
+            update["$push"] = {
+                "moves": san,
+                "evals": analysis.model_dump() if analysis else None,
+            }
             update["$set"] = {"fen": fen, "white_clock": wc, "black_clock": bc}
         case schemas.GameEndEvent(result=result, pgn=pgn, status=status, reason=reason):
             set_fields: dict[str, object] = {

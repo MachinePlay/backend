@@ -38,6 +38,7 @@ from app.schemas import (
     EngineRegisterResponse,
     EngineUpdateRequest,
     EngineVersionUpdateRequest,
+    GameDetailOut,
     GameOut,
     LiveStreamEvent,
     PendingSignupOut,
@@ -293,7 +294,7 @@ async def list_games(limit: int = Query(default=50, ge=1, le=200)) -> list[Game]
     return await games.list_games(limit)
 
 
-@games_router.get("/game/{game_id}", response_model=GameOut)
+@games_router.get("/game/{game_id}", response_model=GameDetailOut)
 async def get_game(game_id: UUID) -> Game:
     return await games.get_game(game_id)
 

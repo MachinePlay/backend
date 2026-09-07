@@ -7,7 +7,7 @@ from beanie import Document, Indexed, Link
 from pydantic import BaseModel, Field
 from pymongo import ASCENDING, IndexModel
 
-from machineplay.schemas import GameStatus, HardwareInfo
+from machineplay.schemas import GameStatus, HardwareInfo, SearchInfo, UciLine
 
 
 def utcnow() -> datetime:
@@ -122,6 +122,13 @@ class Game(UUIDDocument):
     # disconnected", …); None for a plain finish.
     reason: str | None = None
     moves: list[str] = Field(default_factory=list)
+    # What each mover's search reported, parallel to `moves` (None where the
+    # engine said nothing scoreable). Drives the eval bars and the graph.
+    evals: list[SearchInfo | None] = Field(default_factory=list)
+    # The tail of the game's UCI transcript, kept when the game ends so the
+    # debug view still has something to show afterwards. The live stream
+    # carries the full conversation; only this much survives.
+    uci_tail: list[UciLine] = Field(default_factory=list)
     fen: str = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
     pgn: str | None = None
     white_clock: float = 0.0

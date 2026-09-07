@@ -13,6 +13,7 @@ routing on top:
 
 import asyncio
 import logging
+from collections import deque
 from uuid import UUID
 
 from machineplay import schemas
@@ -33,6 +34,7 @@ def _snapshot_event(doc: GameDoc) -> schemas.FenEvent:
         white_name=doc.white_name,
         black_name=doc.black_name,
         moves=doc.moves,
+        evals=doc.evals,
         white_clock=doc.white_clock,
         black_clock=doc.black_clock,
         result=doc.result,
@@ -72,11 +74,19 @@ class Broadcast[T]:
 
 
 class Game(Broadcast[schemas.GameStreamEvent]):
+    # How much of the UCI conversation is kept for late subscribers. The
+    # transcript is unbounded (an engine can print per node), so it is held as
+    # a ring buffer; its tail is persisted when the game ends.
+    UCI_TAIL = 400
+
     def __init__(self, game_id: UUID):
         super().__init__(label=f"game={game_id}", maxsize=256)
         self.game_id = game_id
+        self.uci_lines: deque[schemas.UciLine] = deque(maxlen=self.UCI_TAIL)
 
     async def broadcast(self, event: schemas.GameStreamEvent) -> None:
+        if isinstance(event, schemas.UciLogEvent):
+            self.uci_lines.extend(event.lines)
         self._publish(event)
 
 
@@ -96,6 +106,10 @@ class LiveStream(Broadcast[tuple[UUID, schemas.GameStreamEvent]]):
         self.tracked: set[UUID] = set()
 
     async def broadcast(self, game_id: UUID, event: schemas.GameStreamEvent) -> None:
+        # The home page shows boards and clocks; per-search chatter would be
+        # pure noise there (and a lot of it, times every live game).
+        if isinstance(event, schemas.EngineInfoEvent | schemas.UciLogEvent):
+            return
         if game_id in self.tracked:
             self._publish((game_id, event))
             if isinstance(event, schemas.GameEndEvent):

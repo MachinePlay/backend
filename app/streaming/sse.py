@@ -46,6 +46,10 @@ async def game_event_stream(game_id: UUID) -> AsyncIterator[schemas.GameStreamEv
         if doc is not None:
             snapshot_ply = len(doc.moves)
             yield _snapshot_event(doc)
+        # Whatever of the UCI conversation is still buffered, so a page opened
+        # mid-game shows the recent transcript instead of starting blank.
+        if game.uci_lines:
+            yield schemas.UciLogEvent(lines=list(game.uci_lines))
 
         while True:
             event = await q.get()

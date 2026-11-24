@@ -192,12 +192,35 @@ class Game(UUIDDocument):
         return len(self.opening_moves)
 
     class Settings:
-        # The tournament indexes back the pairings list and the status filters
-        # (dispatch, live boards, standings) respectively.
+        # Side indexes cover the engine game stats, the runner one its game
+        # lists; tournament ones back the pairings, status filters and results.
         indexes = [
             "created_at",
-            IndexModel([("white.$id", ASCENDING)]),
-            IndexModel([("black.$id", ASCENDING)]),
+            *(
+                IndexModel(
+                    [
+                        (f"{side}.$id", ASCENDING),
+                        ("status", ASCENDING),
+                        ("result", ASCENDING),
+                        ("created_at", ASCENDING),
+                    ]
+                )
+                for side in ("white", "black")
+            ),
+            IndexModel(
+                [
+                    ("runner_id", ASCENDING),
+                    ("status", ASCENDING),
+                    ("ended_at", ASCENDING),
+                ]
+            ),
+            IndexModel(
+                [
+                    ("tournament_id", ASCENDING),
+                    ("status", ASCENDING),
+                    ("ended_at", ASCENDING),
+                ]
+            ),
             IndexModel(
                 [
                     ("tournament_id", ASCENDING),

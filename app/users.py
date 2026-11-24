@@ -1,9 +1,9 @@
 """Public user profiles and case-insensitive login lookup."""
 
-from app import engines, games
+from app import engines, games, runners
 from app.exceptions import NotFoundError
-from app.models import Engine, User
-from app.schemas import GameOut, UserProfileOut
+from app.models import Engine, Runner, Tournament, User
+from app.schemas import UserProfileOut
 
 
 async def find_by_login(login: str) -> User | None:
@@ -28,5 +28,11 @@ async def profile(login: str) -> UserProfileOut:
         avatar_url=user.avatar_url,
         created_at=user.created_at,
         engines=await engines.to_out(owned),
-        games=[GameOut.model_validate(g) for g in recent],
+        games=await games.to_out(recent),
+        runners=await runners.to_out(
+            await Runner.find({"owner.$id": user.id}).sort("+created_at").to_list()
+        ),
+        tournament_count=await Tournament.find(
+            Tournament.creator_id == user.id
+        ).count(),
     )

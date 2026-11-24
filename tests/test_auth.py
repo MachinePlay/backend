@@ -2,6 +2,7 @@ import json
 from base64 import b64encode
 from datetime import timedelta
 from typing import Any
+from uuid import uuid4
 
 from httpx import ASGITransport, AsyncClient
 from itsdangerous import TimestampSigner
@@ -9,7 +10,16 @@ from itsdangerous import TimestampSigner
 from app.auth import LAST_USED_THROTTLE, mint_token, user_from_token
 from app.config import settings
 from app.main import app
-from app.models import ApiToken, Engine, Game, User, utcnow
+from app.models import (
+    ApiToken,
+    Engine,
+    Game,
+    Runner,
+    Tournament,
+    TournamentFormat,
+    User,
+    utcnow,
+)
 
 
 def _client() -> AsyncClient:
@@ -215,3 +225,38 @@ async def test_register_engine_rejects_bad_names() -> None:
     body = ok.json()
     assert body["name"] == "mybot"
     assert body["url"].endswith("/uploader/mybot")
+
+
+async def test_handle_check() -> None:
+    await User(github_id=1, login="taken").insert()
+
+    async with _client() as client:
+        free = (await client.get("/auth/handle/Fresh-One")).json()
+        taken = (await client.get("/auth/handle/TAKEN")).json()
+        reserved = (await client.get("/auth/handle/docs")).json()
+        invalid = (await client.get("/auth/handle/-bad")).json()
+
+    assert free == {"available": True, "reason": None}
+    assert taken["available"] is False and "taken" in taken["reason"]
+    assert reserved["available"] is False and "reserved" in reserved["reason"]
+    assert invalid["available"] is False and "1-32" in invalid["reason"]
+
+
+async def test_profile_lists_runners_and_counts_tournaments() -> None:
+    user = await User(github_id=9, login="owner").insert()
+    await Runner(id=uuid4(), owner=user, owner_login="owner", name="box").insert()
+    await Tournament(
+        name="t",
+        creator_id=user.id,
+        created_by="owner",
+        runner_id=uuid4(),
+        tc="10+0.1",
+        format=TournamentFormat.ROUND_ROBIN,
+        games_per_pairing=1,
+    ).insert()
+
+    async with _client() as client:
+        body = (await client.get("/user/owner")).json()
+
+    assert [r["name"] for r in body["runners"]] == ["box"]
+    assert body["tournament_count"] == 1

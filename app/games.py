@@ -8,17 +8,54 @@ from uuid import UUID
 
 from machineplay import schemas
 
-from app import books, runners, streaming
+from app import books, ratings, runners, streaming
 from app.config import settings
 from app.exceptions import ConflictError, NotFoundError, RunnerBusyError
-from app.models import Engine, EngineVersion, Game, User
+from app.models import Engine, EngineVersion, Game, Runner, Tournament, User
 from app.runners import RunnerConnection
-from app.schemas import StartGameRequest, StartGameResponse
+from app.schemas import (
+    GameDetailOut,
+    GameOut,
+    RunnerDetailOut,
+    Score,
+    StartGameRequest,
+    StartGameResponse,
+)
 
 logger = logging.getLogger(__name__)
 
 # Time control "base+inc" in seconds, e.g. "30+0.3" or "60".
 TC_RE = re.compile(r"^\d+(\.\d+)?(\+\d+(\.\d+)?)?$")
+
+
+def latest_score(game: Game) -> Score | None:
+    for ply in range(len(game.evals) - 1, -1, -1):
+        info = game.evals[ply]
+        if info is None:
+            continue
+        # Even plies are White's moves; UCI scores from the mover's side.
+        sign = 1 if ply % 2 == 0 else -1
+        if info.score_mate is not None:
+            return Score(mate=sign * info.score_mate)
+        if info.score_cp is not None:
+            return Score(cp=sign * info.score_cp)
+    return None
+
+
+async def to_out(docs: list[Game]) -> list[GameOut]:
+    ids = list({g.tournament_id for g in docs if g.tournament_id is not None})
+    names = (
+        {t.id: t.name for t in await Tournament.find({"_id": {"$in": ids}}).to_list()}
+        if ids
+        else {}
+    )
+    out = []
+    for g in docs:
+        row = GameOut.model_validate(g)
+        row.tournament_name = names.get(g.tournament_id) if g.tournament_id else None
+        row.score = latest_score(g)
+        out.append(row)
+    return out
 
 
 async def recent_games(engine_ids: list[UUID], limit: int = 20) -> list[Game]:
@@ -245,3 +282,45 @@ async def get_game(game_id: UUID) -> Game:
     if doc is None:
         raise NotFoundError("game not found")
     return doc
+
+
+async def game_detail(game_id: UUID) -> GameDetailOut:
+    doc = await get_game(game_id)
+    [row] = await to_out([doc])
+    detail = GameDetailOut.model_validate(
+        {**row.model_dump(), "evals": doc.evals, "uci_tail": doc.uci_tail}
+    )
+    if doc.runner_id is not None:
+        runner = await Runner.get(doc.runner_id)
+        detail.runner_name = runner.name if runner is not None else None
+    cat = ratings.category(doc.tc or settings.tc)
+    for side, vid in (("white", doc.white_version_id), ("black", doc.black_version_id)):
+        version = await EngineVersion.get(vid) if vid is not None else None
+        if version is not None:
+            setattr(detail, f"{side}_current", version.ratings.get(cat))
+    return detail
+
+
+async def runner_detail(runner_id: UUID) -> RunnerDetailOut:
+    doc = await runners.get_runner(runner_id)
+    [row] = await runners.to_out([doc])
+    playing = (
+        await Game.find(
+            Game.runner_id == runner_id, Game.status == schemas.GameStatus.PLAYING
+        )
+        .sort("+created_at")
+        .to_list()
+    )
+    recent = (
+        await Game.find(
+            Game.runner_id == runner_id, Game.status == schemas.GameStatus.ENDED
+        )
+        .sort("-ended_at")
+        .limit(10)
+        .to_list()
+    )
+    return RunnerDetailOut(
+        **row.model_dump(),
+        playing=await to_out(playing),
+        recent=await to_out(recent),
+    )

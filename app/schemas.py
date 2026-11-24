@@ -53,6 +53,12 @@ class RunnerOut(BaseModel):
     # `telemetry` is the last live sample, present only while online.
     hardware: HardwareInfo | None = None
     telemetry: Telemetry | None = None
+    games_played: int = 0
+
+
+class RunnerDetailOut(RunnerOut):
+    playing: list["GameOut"]
+    recent: list["GameOut"]
 
 
 class RunnerLiveEvent(BaseModel):
@@ -95,6 +101,12 @@ class RegisterRequest(BaseModel):
     login: str
 
 
+class HandleCheckOut(BaseModel):
+    available: bool
+    # Why not, when it isn't.
+    reason: str | None = None
+
+
 class ApiTokenOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -105,16 +117,23 @@ class ApiTokenOut(BaseModel):
 
 
 class EngineOut(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
-
     id: UUID
     name: str
     description: str
     tags: list[str]
     owner_login: str
+    created_at: datetime
     version_count: int = 0
-    # The latest version's.
+    # The latest version's, and how far each moved in the last 7 days.
     ratings: dict[RatingCategory, Rating] = {}
+    week_delta: dict[RatingCategory, float] = {}
+    # Finished games, across all versions.
+    games_played: int = 0
+    wins: int = 0
+    draws: int = 0
+    losses: int = 0
+    # Started, so a game in progress counts.
+    last_game_at: datetime | None = None
 
 
 class EngineVersionOut(BaseModel):
@@ -129,13 +148,7 @@ class EngineVersionOut(BaseModel):
     created_at: datetime
 
 
-class EngineDetailOut(BaseModel):
-    id: UUID
-    name: str
-    description: str
-    tags: list[str]
-    owner_login: str
-    created_at: datetime
+class EngineDetailOut(EngineOut):
     versions: list[EngineVersionOut]
     games: list["GameOut"]
 
@@ -188,6 +201,13 @@ class LiveStreamEvent(BaseModel):
     event: GameStreamEvent
 
 
+class Score(BaseModel):
+    """An eval in White's frame: exactly one of `cp` and `mate` is set."""
+
+    cp: int | None = None
+    mate: int | None = None
+
+
 class GameOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -211,12 +231,16 @@ class GameOut(BaseModel):
     tc: str | None = None
     runner_id: UUID | None = None
     tournament_id: UUID | None = None
+    tournament_name: str | None = None
+    tournament_seq: int | None = None
     rated: bool = False
     white_rating: RatingChange | None = None
     black_rating: RatingChange | None = None
     # `book_plies`: how many leading `moves` came from the book.
     book: str | None = None
     book_plies: int = 0
+    # The latest scored search, for list views without `evals`.
+    score: Score | None = None
     created_at: datetime
     ended_at: datetime | None
 
@@ -228,6 +252,10 @@ class GameDetailOut(GameOut):
     evals: list[SearchInfo | None] = []
     # Empty while the game is live; the SSE stream carries the transcript.
     uci_tail: list[UciLine] = []
+    runner_name: str | None = None
+    # Each version's rating now, in the game's category.
+    white_current: Rating | None = None
+    black_current: Rating | None = None
 
 
 class UserProfileOut(BaseModel):
@@ -239,6 +267,8 @@ class UserProfileOut(BaseModel):
     created_at: datetime
     engines: list[EngineOut]
     games: list[GameOut]
+    runners: list[RunnerOut]
+    tournament_count: int
 
 
 class TournamentEntry(BaseModel):
@@ -308,6 +338,8 @@ class TournamentOut(BaseModel):
     format: TournamentFormat
     status: TournamentStatus
     rated: bool
+    rating_category: RatingCategory
+    tc: str
     runner_id: UUID
     created_by: str
     participant_count: int

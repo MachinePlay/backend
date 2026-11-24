@@ -2,16 +2,28 @@
 
 import logging
 import re
-from typing import NamedTuple
+from collections import defaultdict
+from datetime import datetime, timedelta
+from typing import Any, NamedTuple
 from uuid import UUID
+
+from pydantic import BaseModel
 
 from machineplay.schemas import GameStatus
 
-from app import registry
+from app import games, ratings, registry
 from app.config import settings
 from app.exceptions import ConflictError, ForbiddenError, NotFoundError
-from app.games import recent_games
-from app.models import Engine, EngineVersion, Game, Rating, RatingCategory, User
+from app.models import (
+    Engine,
+    EngineVersion,
+    Game,
+    Rating,
+    RatingCategory,
+    RatingChange,
+    User,
+    utcnow,
+)
 from app.schemas import (
     EngineDetailOut,
     EngineOut,
@@ -20,7 +32,6 @@ from app.schemas import (
     EngineUpdateRequest,
     EngineVersionOut,
     EngineVersionUpdateRequest,
-    GameOut,
 )
 
 logger = logging.getLogger(__name__)
@@ -67,6 +78,7 @@ def normalize_tags(raw: list[str]) -> list[str]:
 
 class _VersionSummary(NamedTuple):
     version_count: int
+    latest_id: UUID
     latest_ratings: dict[RatingCategory, Rating]
 
 
@@ -81,6 +93,7 @@ async def _version_summaries(engine_ids: list[UUID]) -> dict[UUID, _VersionSumma
                 "$group": {
                     "_id": "$engine.$id",
                     "count": {"$sum": 1},
+                    "latest": {"$first": "$_id"},
                     "ratings": {"$first": "$ratings"},
                 }
             },
@@ -89,6 +102,7 @@ async def _version_summaries(engine_ids: list[UUID]) -> dict[UUID, _VersionSumma
     return {
         row["_id"]: _VersionSummary(
             row["count"],
+            row["latest"],
             {
                 RatingCategory(cat): Rating.model_validate(r)
                 for cat, r in (row.get("ratings") or {}).items()
@@ -98,21 +112,146 @@ async def _version_summaries(engine_ids: list[UUID]) -> dict[UUID, _VersionSumma
     }
 
 
-async def to_out(engines: list[Engine]) -> list[EngineOut]:
-    summaries = await _version_summaries([e.id for e in engines])
-    empty = _VersionSummary(0, {})
-    return [
-        EngineOut(
-            id=e.id,
-            name=e.name,
-            description=e.description,
-            tags=e.tags,
-            owner_login=e.owner_login,
-            version_count=summaries.get(e.id, empty).version_count,
-            ratings=summaries.get(e.id, empty).latest_ratings,
+class _GameStats(NamedTuple):
+    played: int = 0
+    wins: int = 0
+    draws: int = 0
+    losses: int = 0
+    last_game_at: datetime | None = None
+
+
+def _outcome(win: str, loss: str) -> dict[str, Any]:
+    return {
+        "$switch": {
+            "branches": [
+                {"case": {"$eq": ["$result", win]}, "then": 1},
+                {"case": {"$eq": ["$result", loss]}, "then": -1},
+                {"case": {"$eq": ["$result", "1/2-1/2"]}, "then": 0},
+            ],
+            "default": None,
+        }
+    }
+
+
+async def _game_stats(engine_ids: list[UUID]) -> dict[UUID, _GameStats]:
+    """One pass per colour, each covered by its (side, status, result,
+    created_at) index."""
+    if not engine_ids:
+        return {}
+    totals: dict[UUID, dict[str, Any]] = defaultdict(
+        lambda: {"games": 0, "wins": 0, "draws": 0, "losses": 0, "last": None}
+    )
+    for side, win, loss in (("white", "1-0", "0-1"), ("black", "0-1", "1-0")):
+        rows = await Game.aggregate(
+            [
+                {
+                    "$match": {
+                        f"{side}.$id": {"$in": engine_ids},
+                        "status": {"$in": [GameStatus.ENDED, GameStatus.PLAYING]},
+                    }
+                },
+                {
+                    "$group": {
+                        "_id": {"e": f"${side}.$id", "o": _outcome(win, loss)},
+                        "ended": {
+                            "$sum": {
+                                "$cond": [{"$eq": ["$status", GameStatus.ENDED]}, 1, 0]
+                            }
+                        },
+                        "last": {"$max": "$created_at"},
+                    }
+                },
+            ]
+        ).to_list()
+        for row in rows:
+            t = totals[row["_id"]["e"]]
+            outcome = row["_id"].get("o")
+            t["games"] += row["ended"]
+            if outcome == 1:
+                t["wins"] += row["ended"]
+            elif outcome == -1:
+                t["losses"] += row["ended"]
+            elif outcome == 0:
+                t["draws"] += row["ended"]
+            if t["last"] is None or row["last"] > t["last"]:
+                t["last"] = row["last"]
+    return {
+        eid: _GameStats(t["games"], t["wins"], t["draws"], t["losses"], t["last"])
+        for eid, t in totals.items()
+    }
+
+
+WEEK = timedelta(days=7)
+
+
+class _RatedGame(BaseModel):
+    white_version_id: UUID | None = None
+    black_version_id: UUID | None = None
+    white_rating: RatingChange | None = None
+    black_rating: RatingChange | None = None
+    tc: str | None = None
+
+
+async def _week_deltas(
+    version_ids: list[UUID],
+) -> dict[UUID, dict[RatingCategory, float]]:
+    """Each version's rating movement over the last week: the sum of its rated
+    games' changes, so no rating history needs keeping."""
+    if not version_ids:
+        return {}
+    rows = (
+        await Game.find(
+            {
+                "rated": True,
+                "rated_at": {"$ne": None},
+                "status": GameStatus.ENDED,
+                "ended_at": {"$gte": utcnow() - WEEK},
+            }
         )
-        for e in engines
-    ]
+        .project(_RatedGame)
+        .to_list()
+    )
+    wanted = set(version_ids)
+    out: dict[UUID, dict[RatingCategory, float]] = defaultdict(dict)
+    for g in rows:
+        cat = ratings.category(g.tc or settings.tc)
+        for vid, change in (
+            (g.white_version_id, g.white_rating),
+            (g.black_version_id, g.black_rating),
+        ):
+            if vid in wanted and change is not None:
+                out[vid][cat] = out[vid].get(cat, 0.0) + change.after - change.before
+    return out
+
+
+async def to_out(engines: list[Engine]) -> list[EngineOut]:
+    ids = [e.id for e in engines]
+    summaries = await _version_summaries(ids)
+    stats = await _game_stats(ids)
+    deltas = await _week_deltas([s.latest_id for s in summaries.values()])
+    out = []
+    for e in engines:
+        summary = summaries.get(e.id)
+        st = stats.get(e.id, _GameStats())
+        out.append(
+            EngineOut(
+                id=e.id,
+                name=e.name,
+                description=e.description,
+                tags=e.tags,
+                owner_login=e.owner_login,
+                created_at=e.created_at,
+                version_count=summary.version_count if summary else 0,
+                ratings=summary.latest_ratings if summary else {},
+                week_delta=deltas.get(summary.latest_id, {}) if summary else {},
+                games_played=st.played,
+                wins=st.wins,
+                draws=st.draws,
+                losses=st.losses,
+                last_game_at=st.last_game_at,
+            )
+        )
+    return out
 
 
 async def list_engines() -> list[EngineOut]:
@@ -132,16 +271,11 @@ async def detail(engine: Engine) -> EngineDetailOut:
         .sort("-created_at")
         .to_list()
     )
-    games = await recent_games([engine.id])
+    [summary] = await to_out([engine])
     return EngineDetailOut(
-        id=engine.id,
-        name=engine.name,
-        description=engine.description,
-        tags=engine.tags,
-        owner_login=engine.owner_login,
-        created_at=engine.created_at,
+        **summary.model_dump(),
         versions=[EngineVersionOut.model_validate(v) for v in versions],
-        games=[GameOut.model_validate(g) for g in games],
+        games=await games.to_out(await games.recent_games([engine.id])),
     )
 
 

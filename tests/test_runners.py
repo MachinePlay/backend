@@ -316,3 +316,35 @@ async def test_finish_game_persists_frees_slot_and_notifies_hooks() -> None:
     assert refreshed.reason == "checkmate"
     assert conn.active_games == 0  # slot freed
     assert seen == [(game.id, "checkmate")]
+
+
+async def test_runner_detail_lists_playing_and_finished_games() -> None:
+    owner = await User(github_id=30, login="rio").insert()
+    doc = await Runner(id=uuid4(), owner=owner, owner_login="rio", name="r").insert()
+    engine = await Engine(name="e", owner=owner, owner_login="rio").insert()
+
+    def game(status: ws_schemas.GameStatus) -> Game:
+        return Game(
+            white=engine,
+            black=engine,
+            white_name="e",
+            black_name="e",
+            white_version="v1",
+            black_version="v1",
+            runner_id=doc.id,
+            status=status,
+        )
+
+    await game(ws_schemas.GameStatus.PLAYING).insert()
+    await game(ws_schemas.GameStatus.ENDED).insert()
+    await game(ws_schemas.GameStatus.ENDED).insert()
+    await game(ws_schemas.GameStatus.ABORTED).insert()
+
+    async with _client() as client:
+        body = (await client.get(f"/runner/{doc.id}")).json()
+        listed = (await client.get("/runners")).json()
+
+    assert body["games_played"] == 2
+    assert len(body["playing"]) == 1
+    assert len(body["recent"]) == 2
+    assert listed[0]["games_played"] == 2

@@ -23,7 +23,7 @@ from app import (
     tournaments,
     users,
 )
-from app.models import ApiToken, Game, User
+from app.models import ApiToken, User
 from app.schemas import (
     ApiTokenOut,
     BookOut,
@@ -35,11 +35,13 @@ from app.schemas import (
     EngineVersionUpdateRequest,
     GameDetailOut,
     GameOut,
+    HandleCheckOut,
     LiveStreamEvent,
     PendingSignupOut,
     RebuildRatingsOut,
     RegisterRequest,
     RegistryTokenOut,
+    RunnerDetailOut,
     RunnerLiveEvent,
     RunnerOut,
     RunnerUpdateRequest,
@@ -76,6 +78,13 @@ async def github_callback(request: Request, code: str, state: str) -> RedirectRe
 async def pending_signup(request: Request) -> PendingSignupOut:
     """The GitHub profile waiting on a handle, for the /register page."""
     return auth.pending_signup(request.session)
+
+
+@auth_router.get("/auth/handle/{login}", response_model=HandleCheckOut)
+async def check_handle(login: str) -> HandleCheckOut:
+    """Whether a handle is free to register, for the /register page."""
+    reason = await auth.handle_problem(login.strip().lower())
+    return HandleCheckOut(available=reason is None, reason=reason)
 
 
 @auth_router.post("/auth/register", response_model=UserOut)
@@ -230,10 +239,11 @@ async def list_runners() -> list[RunnerOut]:
     return await runners.list_runners()
 
 
-@runners_router.get("/runner/{runner_id}", response_model=RunnerOut)
-async def get_runner(runner_id: UUID) -> RunnerOut:
-    """One runner's durable metadata joined with its live online status."""
-    return await runners.get_runner(runner_id)
+@runners_router.get("/runner/{runner_id}", response_model=RunnerDetailOut)
+async def get_runner(runner_id: UUID) -> RunnerDetailOut:
+    """One runner's durable metadata, live status, and its playing and
+    recently finished games."""
+    return await games.runner_detail(runner_id)
 
 
 @runners_router.patch("/runner/{runner_id}", response_model=RunnerOut)
@@ -266,13 +276,13 @@ async def cancel_game(
 
 
 @games_router.get("/game", response_model=list[GameOut])
-async def list_games(limit: int = Query(default=50, ge=1, le=200)) -> list[Game]:
-    return await games.list_games(limit)
+async def list_games(limit: int = Query(default=50, ge=1, le=200)) -> list[GameOut]:
+    return await games.to_out(await games.list_games(limit))
 
 
 @games_router.get("/game/{game_id}", response_model=GameDetailOut)
-async def get_game(game_id: UUID) -> Game:
-    return await games.get_game(game_id)
+async def get_game(game_id: UUID) -> GameDetailOut:
+    return await games.game_detail(game_id)
 
 
 tournaments_router = APIRouter(tags=["Tournaments"])

@@ -1,3 +1,4 @@
+from datetime import timedelta
 from uuid import uuid4
 
 import chess
@@ -16,6 +17,7 @@ from app.models import (
     TournamentFormat,
     TournamentStatus,
     User,
+    utcnow,
 )
 from app.schemas import TournamentCreateRequest, TournamentEntry
 
@@ -705,6 +707,41 @@ async def test_games_page_is_ordered_filtered_and_bounded() -> None:
         )
         assert playing.total == 1
         assert playing.games[0].status == GameStatus.PLAYING
+    finally:
+        _cleanup(conn)
+
+
+async def test_finished_pairings_list_newest_first() -> None:
+    user = await User(github_id=24, login="max").insert()
+    e1 = await _engine(user, "a")
+    e2 = await _engine(user, "b")
+    conn = await _online_runner(user, max_games=1)
+    try:
+        tour = await tournaments.create_tournament(
+            user,
+            TournamentCreateRequest(
+                name="results",
+                format=TournamentFormat.ROUND_ROBIN,
+                entries=_entries(e1, e2),
+                games_per_pairing=3,
+                runner_id=conn.runner_id,
+            ),
+        )
+        scheduled = (
+            await Game.find(Game.tournament_id == tour.id)
+            .sort("+tournament_seq")
+            .to_list()
+        )
+        # Finished in reverse schedule order.
+        for minutes, doc in enumerate(reversed(scheduled)):
+            doc.status = GameStatus.ENDED
+            doc.ended_at = utcnow() + timedelta(minutes=minutes)
+            await doc.save()
+
+        ended = await tournaments.tournament_games(
+            tour.id, GameStatus.ENDED, limit=50, offset=0
+        )
+        assert [g.id for g in ended.games] == [g.id for g in scheduled]
     finally:
         _cleanup(conn)
 

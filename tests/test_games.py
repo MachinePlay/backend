@@ -2,11 +2,20 @@ from uuid import uuid4
 
 from httpx import ASGITransport, AsyncClient
 from machineplay import schemas as ws_schemas
+from machineplay.schemas import SearchInfo
 
 from app import books, games, runners, streaming
 from app.auth import mint_token
 from app.main import app
-from app.models import Engine, EngineVersion, Game, Runner, User
+from app.models import (
+    Engine,
+    EngineVersion,
+    Game,
+    Runner,
+    Tournament,
+    TournamentFormat,
+    User,
+)
 
 
 async def _setup() -> tuple[dict[str, str], User, Engine, EngineVersion]:
@@ -303,3 +312,37 @@ async def test_list_books_endpoint() -> None:
     # A count, not the lines themselves.
     assert rows[0]["lines"] > 100
     assert rows[0]["plies"] == books.PLIES
+
+
+async def test_game_list_names_the_tournament_and_carries_the_latest_score() -> None:
+    _, user, engine, _ = await _setup()
+    tour = await Tournament(
+        name="Winter Open",
+        creator_id=user.id,
+        created_by=user.login,
+        runner_id=uuid4(),
+        tc="10+0.1",
+        format=TournamentFormat.ROUND_ROBIN,
+        games_per_pairing=1,
+    ).insert()
+    await Game(
+        white=engine,
+        black=engine,
+        white_name="bot",
+        black_name="bot",
+        white_version="v1",
+        black_version="v1",
+        tournament_id=tour.id,
+        moves=["e4", "e5", "Nf3"],
+        # Black's +50 from its own side is -50 for White; the later None and
+        # unscored entries don't count.
+        evals=[SearchInfo(score_cp=30), SearchInfo(score_cp=50), None],
+    ).insert()
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        [row] = (await client.get("/game")).json()
+
+    assert row["tournament_name"] == "Winter Open"
+    assert row["score"] == {"cp": -50, "mate": None}

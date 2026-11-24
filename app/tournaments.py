@@ -38,7 +38,6 @@ from app.models import (
 )
 from app.runners import RunnerConnection
 from app.schemas import (
-    GameOut,
     StandingRow,
     TournamentCreateRequest,
     TournamentDetailOut,
@@ -564,7 +563,7 @@ async def tournament_detail(tournament_id: UUID) -> TournamentDetailOut:
         ],
         standings=compute_standings(tour, counts, current),
         progress=progress,
-        live_games=[GameOut.model_validate(g) for g in live],
+        live_games=await games.to_out(live),
         eta_seconds=eta,
         created_at=tour.created_at,
         ended_at=tour.ended_at,
@@ -582,9 +581,12 @@ async def tournament_games(
     if status is not None:
         query["status"] = status
     total = await Game.find(query).count()
+    # Results read newest first; everything else in schedule order.
+    finished = status in (GameStatus.ENDED, GameStatus.ABORTED)
+    order = ("-ended_at", "+tournament_seq") if finished else ("+tournament_seq",)
     docs = (
         await Game.find(query)
-        .sort("+tournament_seq", "+created_at")
+        .sort(*order, "+created_at")
         .skip(offset)
         .limit(limit)
         .to_list()
@@ -605,6 +607,8 @@ async def list_tournaments(limit: int) -> list[TournamentOut]:
             format=t.format,
             status=t.status,
             rated=t.rated,
+            rating_category=ratings.category(t.tc),
+            tc=t.tc,
             runner_id=t.runner_id,
             created_by=t.created_by,
             participant_count=len(t.participants),

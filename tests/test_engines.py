@@ -1,5 +1,6 @@
 import json
 from base64 import b64encode
+from datetime import timedelta
 from uuid import UUID, uuid4
 
 from httpx import ASGITransport, AsyncClient
@@ -9,7 +10,7 @@ from machineplay.schemas import GameStatus
 from app.auth import mint_token
 from app.config import settings
 from app.main import app
-from app.models import Engine, EngineVersion, Game, User
+from app.models import Engine, EngineVersion, Game, RatingChange, User, utcnow
 from itsdangerous import TimestampSigner
 
 
@@ -491,3 +492,45 @@ async def test_register_version_rejects_a_label_that_is_not_tag_shaped() -> None
 
     assert rejected.status_code == 409
     assert accepted.status_code == 200
+
+
+async def test_engine_stats_count_finished_games_from_both_sides() -> None:
+    alice = await User(github_id=1, login="alice").insert()
+    a = await _engine_with_version(alice, "a")
+    b = await _engine_with_version(alice, "b", digest="sha256:bbb")
+    va = await _only_version(a)
+
+    def finished(white: Engine, black: Engine, result: str) -> Game:
+        g = _game(white, black, GameStatus.ENDED)
+        g.result = result
+        g.ended_at = utcnow()
+        return g
+
+    won = finished(a, b, "1-0")
+    won.rated, won.rated_at, won.tc = True, utcnow(), "180+2"
+    won.white_version_id = va.id
+    won.white_rating = RatingChange(before=1500, after=1520)
+    old = finished(b, a, "0-1")
+    old.rated, old.rated_at, old.tc = True, utcnow(), "180+2"
+    old.black_version_id = va.id
+    old.black_rating = RatingChange(before=1480, after=1500)
+    old.ended_at = utcnow() - timedelta(days=8)
+    await won.insert()
+    await old.insert()
+    await finished(b, a, "1/2-1/2").insert()
+    await finished(a, b, "0-1").insert()
+    await _game(a, b, GameStatus.PLAYING).insert()
+    await _game(a, b, GameStatus.ABORTED).insert()
+
+    async with _client() as client:
+        body = (await client.get("/engine")).json()
+        detail = (await client.get("/user/alice/a")).json()
+
+    stats = next(e for e in body if e["name"] == "a")
+    assert (stats["wins"], stats["draws"], stats["losses"]) == (2, 1, 1)
+    assert stats["games_played"] == 4
+    assert stats["last_game_at"] is not None
+    # Only the rated game inside the last week moves the weekly delta.
+    assert stats["week_delta"] == {"blitz": 20.0}
+    assert detail["games_played"] == 4
+    assert len(detail["versions"]) == 1

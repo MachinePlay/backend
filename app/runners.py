@@ -9,7 +9,7 @@ from uuid import UUID
 from machineplay import schemas
 
 from app.exceptions import ForbiddenError, NotFoundError
-from app.models import Runner as RunnerDoc, User, utcnow
+from app.models import Game, Runner as RunnerDoc, User, utcnow
 from app.schemas import RunnerLiveEvent, RunnerOut, RunnerUpdateRequest
 
 logger = logging.getLogger(__name__)
@@ -176,7 +176,22 @@ async def touch_last_seen(runner_id: UUID) -> None:
     )
 
 
-def _to_out(doc: RunnerDoc) -> RunnerOut:
+async def _games_played(runner_ids: list[UUID]) -> dict[UUID, int]:
+    rows = await Game.aggregate(
+        [
+            {
+                "$match": {
+                    "runner_id": {"$in": runner_ids},
+                    "status": schemas.GameStatus.ENDED,
+                }
+            },
+            {"$group": {"_id": "$runner_id", "n": {"$sum": 1}}},
+        ]
+    ).to_list()
+    return {row["_id"]: row["n"] for row in rows}
+
+
+def _to_out(doc: RunnerDoc, games_played: int = 0) -> RunnerOut:
     conn = _online.get(doc.id)
     return RunnerOut(
         runner_id=doc.id,
@@ -189,19 +204,24 @@ def _to_out(doc: RunnerDoc) -> RunnerOut:
         last_seen_at=doc.last_seen_at,
         hardware=doc.hardware,
         telemetry=conn.latest_telemetry if conn is not None else None,
+        games_played=games_played,
     )
 
 
+async def to_out(docs: list[RunnerDoc]) -> list[RunnerOut]:
+    played = await _games_played([d.id for d in docs])
+    return [_to_out(doc, played.get(doc.id, 0)) for doc in docs]
+
+
 async def list_runners() -> list[RunnerOut]:
-    docs = await RunnerDoc.find_all().sort("+created_at").to_list()
-    return [_to_out(doc) for doc in docs]
+    return await to_out(await RunnerDoc.find_all().sort("+created_at").to_list())
 
 
-async def get_runner(runner_id: UUID) -> RunnerOut:
+async def get_runner(runner_id: UUID) -> RunnerDoc:
     doc = await RunnerDoc.get(runner_id)
     if doc is None:
         raise NotFoundError("runner not found", details={"runner_id": str(runner_id)})
-    return _to_out(doc)
+    return doc
 
 
 async def edit_runner(
@@ -217,4 +237,5 @@ async def edit_runner(
     if patch.description is not None:
         doc.description = patch.description
     await doc.save()
-    return _to_out(doc)
+    [out] = await to_out([doc])
+    return out

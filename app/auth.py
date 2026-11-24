@@ -265,6 +265,20 @@ def pending_signup(session: Session) -> PendingSignupOut:
     )
 
 
+async def handle_problem(login: str) -> str | None:
+    """Why `login` (already lowercased) can't be registered, or None."""
+    if not HANDLE_RE.fullmatch(login):
+        return (
+            "handle must be 1-32 characters: a-z, 0-9 and single hyphens, "
+            "starting and ending with a letter or digit"
+        )
+    if login in RESERVED_HANDLES:
+        return f"handle {login!r} is reserved"
+    if await users.find_by_login(login) is not None:
+        return f"handle {login!r} is already taken"
+    return None
+
+
 async def register(session: Session, requested_login: str) -> User:
     """Complete a pending GitHub signup with the chosen handle and log it in."""
     pending = session.get("pending_signup")
@@ -275,15 +289,9 @@ async def register(session: Session, requested_login: str) -> User:
     user = await User.find_one(User.github_id == pending["github_id"])
     if user is None:
         login = requested_login.strip().lower()
-        if not HANDLE_RE.fullmatch(login):
-            raise ConflictError(
-                "handle must be 1-32 characters: a-z, 0-9 and single hyphens, "
-                "starting and ending with a letter or digit"
-            )
-        if login in RESERVED_HANDLES:
-            raise ConflictError(f"handle {login!r} is reserved")
-        if await users.find_by_login(login) is not None:
-            raise ConflictError(f"handle {login!r} is already taken")
+        problem = await handle_problem(login)
+        if problem is not None:
+            raise ConflictError(problem)
         user = User(
             github_id=pending["github_id"],
             login=login,

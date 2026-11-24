@@ -63,7 +63,7 @@ class Broadcast[T]:
 
 class Game(Broadcast[schemas.GameStreamEvent]):
     # A ring buffer: an engine can print per node.
-    UCI_TAIL = 400
+    UCI_TAIL = 100
 
     def __init__(self, game_id: UUID):
         super().__init__(label=f"game={game_id}", maxsize=256)

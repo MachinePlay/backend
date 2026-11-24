@@ -68,6 +68,7 @@ def build_game(
     runner_id: UUID | None = None,
     tournament_id: UUID | None = None,
     tournament_seq: int | None = None,
+    rated: bool = False,
     book: str | None = None,
     opening_moves: list[str] | None = None,
 ) -> Game:
@@ -87,6 +88,7 @@ def build_game(
         runner_id=runner_id,
         tournament_id=tournament_id,
         tournament_seq=tournament_seq,
+        rated=rated,
         book=book,
         opening_moves=opening_moves or [],
         tc=tc,

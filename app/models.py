@@ -9,6 +9,8 @@ from pymongo import ASCENDING, IndexModel
 
 from machineplay.schemas import GameStatus, HardwareInfo, SearchInfo, UciLine
 
+from app import glicko2
+
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
@@ -54,6 +56,30 @@ class Engine(UUIDDocument):
         ]
 
 
+class RatingCategory(StrEnum):
+    BULLET = "bullet"
+    BLITZ = "blitz"
+    RAPID = "rapid"
+
+
+class Rating(BaseModel):
+    """Glicko-2 on the display scale: `phi` is the rating deviation (RD)."""
+
+    mu: float
+    phi: float
+    sigma: float
+    games: int
+
+    @classmethod
+    def initial(cls) -> "Rating":
+        return cls(mu=glicko2.MU, phi=glicko2.PHI, sigma=glicko2.SIGMA, games=0)
+
+
+class RatingChange(BaseModel):
+    before: float
+    after: float
+
+
 class EngineVersion(UUIDDocument):
     engine: Link[Engine]
     version: str
@@ -62,6 +88,8 @@ class EngineVersion(UUIDDocument):
     image_repository: str
     image_digest: str
     size_bytes: int = 0
+    # Only categories the version has rated games in.
+    ratings: dict[RatingCategory, Rating] = Field(default_factory=dict)
     created_at: datetime = Field(default_factory=utcnow)
 
     class Settings:
@@ -123,6 +151,11 @@ class Game(UUIDDocument):
     # round). Pairings are inserted in one batch, so `created_at` can't order them.
     tournament_id: UUID | None = None
     tournament_seq: int | None = None
+    # Copied from the tournament, so the unrated-games query needs no join.
+    rated: bool = False
+    rated_at: datetime | None = None
+    white_rating: RatingChange | None = None
+    black_rating: RatingChange | None = None
     # The dealt line itself, not a (book, index) reference, so the game still
     # says what it played after the book changes.
     book: str | None = None
@@ -180,6 +213,14 @@ class Game(UUIDDocument):
                     ("created_at", ASCENDING),
                 ]
             ),
+            IndexModel(
+                [
+                    ("rated", ASCENDING),
+                    ("rated_at", ASCENDING),
+                    ("status", ASCENDING),
+                    ("ended_at", ASCENDING),
+                ]
+            ),
         ]
 
 
@@ -212,6 +253,7 @@ class Tournament(UUIDDocument):
     runner_id: UUID
     tc: str
     format: TournamentFormat
+    rated: bool = False
     # Colors alternate across a pairing's games; odd counts are allowed.
     games_per_pairing: int
     # GAUNTLET only: the participant that plays everyone else.

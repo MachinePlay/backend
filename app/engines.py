@@ -2,6 +2,7 @@
 
 import logging
 import re
+from typing import NamedTuple
 from uuid import UUID
 
 from machineplay.schemas import GameStatus
@@ -10,7 +11,7 @@ from app import registry
 from app.config import settings
 from app.exceptions import ConflictError, ForbiddenError, NotFoundError
 from app.games import recent_games
-from app.models import Engine, EngineVersion, Game, User
+from app.models import Engine, EngineVersion, Game, Rating, RatingCategory, User
 from app.schemas import (
     EngineDetailOut,
     EngineOut,
@@ -64,20 +65,42 @@ def normalize_tags(raw: list[str]) -> list[str]:
     return tags
 
 
-async def _version_counts(engine_ids: list[UUID]) -> dict[UUID, int]:
+class _VersionSummary(NamedTuple):
+    version_count: int
+    latest_ratings: dict[RatingCategory, Rating]
+
+
+async def _version_summaries(engine_ids: list[UUID]) -> dict[UUID, _VersionSummary]:
     if not engine_ids:
         return {}
     rows = await EngineVersion.aggregate(
         [
             {"$match": {"engine.$id": {"$in": engine_ids}}},
-            {"$group": {"_id": "$engine.$id", "count": {"$sum": 1}}},
+            {"$sort": {"created_at": -1}},
+            {
+                "$group": {
+                    "_id": "$engine.$id",
+                    "count": {"$sum": 1},
+                    "ratings": {"$first": "$ratings"},
+                }
+            },
         ]
     ).to_list()
-    return {row["_id"]: row["count"] for row in rows}
+    return {
+        row["_id"]: _VersionSummary(
+            row["count"],
+            {
+                RatingCategory(cat): Rating.model_validate(r)
+                for cat, r in (row.get("ratings") or {}).items()
+            },
+        )
+        for row in rows
+    }
 
 
 async def to_out(engines: list[Engine]) -> list[EngineOut]:
-    counts = await _version_counts([e.id for e in engines])
+    summaries = await _version_summaries([e.id for e in engines])
+    empty = _VersionSummary(0, {})
     return [
         EngineOut(
             id=e.id,
@@ -85,7 +108,8 @@ async def to_out(engines: list[Engine]) -> list[EngineOut]:
             description=e.description,
             tags=e.tags,
             owner_login=e.owner_login,
-            version_count=counts.get(e.id, 0),
+            version_count=summaries.get(e.id, empty).version_count,
+            ratings=summaries.get(e.id, empty).latest_ratings,
         )
         for e in engines
     ]

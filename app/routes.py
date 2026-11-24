@@ -16,6 +16,7 @@ from app import (
     books,
     engines,
     games,
+    ratings,
     registry,
     runners,
     streaming,
@@ -36,6 +37,7 @@ from app.schemas import (
     GameOut,
     LiveStreamEvent,
     PendingSignupOut,
+    RebuildRatingsOut,
     RegisterRequest,
     RegistryTokenOut,
     RunnerLiveEvent,
@@ -342,6 +344,17 @@ async def list_books() -> list[BookOut]:
     ]
 
 
+admin_router = APIRouter(tags=["Admin"])
+
+
+@admin_router.post("/admin/ratings/rebuild", response_model=RebuildRatingsOut)
+async def rebuild_ratings(
+    user: User = Depends(auth.require_user),
+) -> RebuildRatingsOut:
+    """Forget every rating and replay all rated games in end order."""
+    return RebuildRatingsOut(games=await ratings.rebuild_as(user))
+
+
 streaming_router = APIRouter(tags=["Live streaming"])
 
 
@@ -388,4 +401,5 @@ router.include_router(games_router)
 router.include_router(runners_router)
 router.include_router(tournaments_router)
 router.include_router(books_router)
+router.include_router(admin_router)
 router.include_router(streaming_router)

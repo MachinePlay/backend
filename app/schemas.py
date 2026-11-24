@@ -4,7 +4,13 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field
 
 from app import books
-from app.models import TournamentFormat, TournamentStatus
+from app.models import (
+    Rating,
+    RatingCategory,
+    RatingChange,
+    TournamentFormat,
+    TournamentStatus,
+)
 from machineplay.schemas import (
     GameStatus,
     GameStreamEvent,
@@ -107,6 +113,8 @@ class EngineOut(BaseModel):
     tags: list[str]
     owner_login: str
     version_count: int = 0
+    # The latest version's.
+    ratings: dict[RatingCategory, Rating] = {}
 
 
 class EngineVersionOut(BaseModel):
@@ -117,6 +125,7 @@ class EngineVersionOut(BaseModel):
     size_bytes: int
     image_repository: str
     image_digest: str
+    ratings: dict[RatingCategory, Rating]
     created_at: datetime
 
 
@@ -202,6 +211,9 @@ class GameOut(BaseModel):
     tc: str | None = None
     runner_id: UUID | None = None
     tournament_id: UUID | None = None
+    rated: bool = False
+    white_rating: RatingChange | None = None
+    black_rating: RatingChange | None = None
     # `book_plies`: how many leading `moves` came from the book.
     book: str | None = None
     book_plies: int = 0
@@ -238,6 +250,7 @@ class TournamentEntry(BaseModel):
 class TournamentCreateRequest(BaseModel):
     name: str
     format: TournamentFormat
+    rated: bool = True
     # Distinct (engine, version) pairs: one engine may enter at two versions.
     entries: list[TournamentEntry]
     # GAUNTLET only: index into `entries` of the head participant.
@@ -282,6 +295,9 @@ class StandingRow(BaseModel):
     draws: int
     losses: int
     score: float
+    # Current, in the tournament's category; None in unrated tournaments.
+    rating: Rating | None = None
+    rating_delta: float | None = None
 
 
 class TournamentOut(BaseModel):
@@ -291,6 +307,7 @@ class TournamentOut(BaseModel):
     name: str
     format: TournamentFormat
     status: TournamentStatus
+    rated: bool
     runner_id: UUID
     created_by: str
     participant_count: int
@@ -342,6 +359,8 @@ class TournamentDetailOut(BaseModel):
     name: str
     format: TournamentFormat
     status: TournamentStatus
+    rated: bool
+    rating_category: RatingCategory
     runner_id: UUID
     created_by: str
     tc: str
@@ -359,3 +378,7 @@ class TournamentDetailOut(BaseModel):
     eta_seconds: float | None = None
     created_at: datetime
     ended_at: datetime | None = None
+
+
+class RebuildRatingsOut(BaseModel):
+    games: int

@@ -8,7 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.routing import APIRoute
 from starlette.middleware.sessions import SessionMiddleware
 
-from app import books, db, streaming
+from app import books, db, ratings, streaming
 from app.config import settings
 from app.exceptions import AppException
 from app.routes import router
@@ -26,6 +26,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     client = await db.connect()
     await books.seed()
     await streaming.abort_orphan_games()
+    # Also the backfill: games that ended while no backend was rating them.
+    rated = await ratings.rate_unrated()
+    if rated:
+        logger.info("rated %d game(s) on startup", rated)
     try:
         yield
     finally:
@@ -81,6 +85,10 @@ TAGS_METADATA = [
         "name": "Opening books",
         "description": "The opening lines games are dealt to start from, so "
         "two deterministic engines don't replay one game all tournament.",
+    },
+    {
+        "name": "Admin",
+        "description": "Maintenance endpoints for admins.",
     },
     {
         "name": "Live streaming",

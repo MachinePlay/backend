@@ -14,7 +14,7 @@ from uuid import UUID
 
 from machineplay.schemas import GameEndEvent, GameStatus, StopGame
 
-from app import books, games, runners, streaming
+from app import books, games, ratings, runners, streaming
 from app.config import settings
 from app.exceptions import (
     ConflictError,
@@ -27,6 +27,7 @@ from app.models import (
     Engine,
     EngineVersion,
     Game,
+    Rating,
     Runner,
     Tournament,
     TournamentFormat,
@@ -172,6 +173,7 @@ async def create_tournament(user: User, payload: TournamentCreateRequest) -> Tou
         runner_id=runner.runner_id,
         tc=tc,
         format=payload.format,
+        rated=payload.rated,
         games_per_pairing=payload.games_per_pairing,
         gauntlet_head_version_id=(
             participants[head].version_id if head is not None else None
@@ -194,6 +196,7 @@ async def create_tournament(user: User, payload: TournamentCreateRequest) -> Tou
                 runner_id=runner.runner_id,
                 tournament_id=tour.id,
                 tournament_seq=seq,
+                rated=tour.rated,
                 book=tour.book,
                 # Wraps when there are more rounds than lines.
                 opening_moves=(lines[pairing.opening % len(lines)] if lines else []),
@@ -385,6 +388,8 @@ class OutcomeCount(NamedTuple):
     result: str | None
     # Not `count`, which NamedTuple inherits from tuple.
     game_count: int
+    white_delta: float = 0.0
+    black_delta: float = 0.0
 
 
 async def _outcome_counts(tournament_id: UUID) -> list[OutcomeCount]:
@@ -400,6 +405,17 @@ async def _outcome_counts(tournament_id: UUID) -> list[OutcomeCount]:
                         "result": "$result",
                     },
                     "count": {"$sum": 1},
+                    # $subtract of a missing field is null, which $sum skips.
+                    "white_delta": {
+                        "$sum": {
+                            "$subtract": ["$white_rating.after", "$white_rating.before"]
+                        }
+                    },
+                    "black_delta": {
+                        "$sum": {
+                            "$subtract": ["$black_rating.after", "$black_rating.before"]
+                        }
+                    },
                 }
             },
         ]
@@ -411,6 +427,8 @@ async def _outcome_counts(tournament_id: UUID) -> list[OutcomeCount]:
             black_version_id=row["_id"].get("black"),
             result=row["_id"].get("result"),
             game_count=row["count"],
+            white_delta=row["white_delta"],
+            black_delta=row["black_delta"],
         )
         for row in rows
     ]
@@ -430,13 +448,17 @@ def compute_progress(counts: list[OutcomeCount]) -> TournamentProgress:
 
 
 def compute_standings(
-    tour: Tournament, counts: list[OutcomeCount]
+    tour: Tournament,
+    counts: list[OutcomeCount],
+    current: dict[UUID, Rating] | None = None,
 ) -> list[StandingRow]:
-    """W=1 / D=0.5 / L=0 over ENDED games, keyed by version id."""
+    """W=1 / D=0.5 / L=0 over ENDED games, keyed by version id. `current` is
+    each version's rating in the tournament's category."""
     parts = {p.version_id: p for p in tour.participants}
     wins: dict[UUID, int] = {vid: 0 for vid in parts}
     draws: dict[UUID, int] = {vid: 0 for vid in parts}
     losses: dict[UUID, int] = {vid: 0 for vid in parts}
+    deltas: dict[UUID, float] = {vid: 0.0 for vid in parts}
 
     for row in counts:
         if row.status != GameStatus.ENDED:
@@ -444,6 +466,8 @@ def compute_standings(
         w, b = row.white_version_id, row.black_version_id
         if w not in parts or b not in parts:
             continue
+        deltas[w] += row.white_delta
+        deltas[b] += row.black_delta
         if row.result == "1-0":
             wins[w] += row.game_count
             losses[b] += row.game_count
@@ -465,6 +489,8 @@ def compute_standings(
             draws=draws[vid],
             losses=losses[vid],
             score=wins[vid] + 0.5 * draws[vid],
+            rating=(current or {}).get(vid) if tour.rated else None,
+            rating_delta=deltas[vid] if tour.rated else None,
         )
         for vid, p in parts.items()
     ]
@@ -500,6 +526,11 @@ async def tournament_detail(tournament_id: UUID) -> TournamentDetailOut:
     tour = await get_tournament(tournament_id)
     counts = await _outcome_counts(tour.id)
     progress = compute_progress(counts)
+    category = ratings.category(tour.tc)
+    versions = await EngineVersion.find(
+        {"_id": {"$in": [p.version_id for p in tour.participants]}}
+    ).to_list()
+    current = {v.id: v.ratings[category] for v in versions if category in v.ratings}
     book = await Book.find_one(Book.slug == tour.book) if tour.book else None
     live = (
         await Game.find(
@@ -522,6 +553,8 @@ async def tournament_detail(tournament_id: UUID) -> TournamentDetailOut:
         name=tour.name,
         format=tour.format,
         status=tour.status,
+        rated=tour.rated,
+        rating_category=category,
         runner_id=tour.runner_id,
         created_by=tour.created_by,
         tc=tour.tc,
@@ -532,7 +565,7 @@ async def tournament_detail(tournament_id: UUID) -> TournamentDetailOut:
         participants=[
             TournamentParticipantOut.model_validate(p) for p in tour.participants
         ],
-        standings=compute_standings(tour, counts),
+        standings=compute_standings(tour, counts, current),
         progress=progress,
         live_games=[GameOut.model_validate(g) for g in live],
         eta_seconds=eta,
@@ -574,6 +607,7 @@ async def list_tournaments(limit: int) -> list[TournamentOut]:
             name=t.name,
             format=t.format,
             status=t.status,
+            rated=t.rated,
             runner_id=t.runner_id,
             created_by=t.created_by,
             participant_count=len(t.participants),

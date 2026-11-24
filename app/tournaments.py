@@ -51,10 +51,9 @@ from app.schemas import (
 
 logger = logging.getLogger(__name__)
 
-MAX_PARTICIPANTS = 8
 
 # Capped on total games, since round-robin pairings grow quadratically. A
-# finished game doc runs to ~100KB, and past ~2000 games elo error bars
+# finished game doc runs to ~30KB, and past ~2000 games elo error bars
 # (~±13) stop shrinking usefully.
 MAX_GAMES_PER_TOURNAMENT = 2000
 
@@ -112,8 +111,6 @@ async def create_tournament(user: User, payload: TournamentCreateRequest) -> Tou
     n = len(payload.entries)
     if n < 2:
         raise ConflictError("a tournament needs at least 2 participants")
-    if n > MAX_PARTICIPANTS:
-        raise ConflictError(f"at most {MAX_PARTICIPANTS} participants per tournament")
 
     head: int | None = None
     if payload.format == TournamentFormat.GAUNTLET:

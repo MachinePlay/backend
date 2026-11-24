@@ -6,6 +6,7 @@ import random
 import re
 from uuid import UUID
 
+from beanie.operators import In
 from machineplay import schemas
 
 from app import books, ratings, runners, streaming
@@ -274,7 +275,21 @@ async def cancel_game(user: User, game_id: UUID) -> None:
 
 
 async def list_games(limit: int) -> list[Game]:
-    return await Game.find_all().sort("-created_at").limit(limit).to_list()
+    """Every playing game, then the `limit` most recently finished ones."""
+    playing = (
+        await Game.find(Game.status == schemas.GameStatus.PLAYING)
+        .sort("-created_at")
+        .to_list()
+    )
+    finished = (
+        await Game.find(
+            In(Game.status, [schemas.GameStatus.ENDED, schemas.GameStatus.ABORTED])
+        )
+        .sort("-ended_at")
+        .limit(limit)
+        .to_list()
+    )
+    return playing + finished
 
 
 async def get_game(game_id: UUID) -> Game:

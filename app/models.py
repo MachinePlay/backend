@@ -5,7 +5,7 @@ from uuid import UUID, uuid4
 
 from beanie import Document, Indexed, Link
 from pydantic import BaseModel, Field
-from pymongo import ASCENDING, IndexModel
+from pymongo import ASCENDING, DESCENDING, IndexModel
 
 from machineplay.schemas import GameStatus, HardwareInfo, SearchInfo, UciLine
 
@@ -193,9 +193,11 @@ class Game(UUIDDocument):
 
     class Settings:
         # Side indexes cover the engine game stats, the runner one its game
-        # lists; tournament ones back the pairings, status filters and results.
+        # lists, the status one the home page; tournament ones back the pairings,
+        # status filters and results.
         indexes = [
             "created_at",
+            IndexModel([("status", ASCENDING), ("ended_at", DESCENDING)]),
             *(
                 IndexModel(
                     [

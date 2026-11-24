@@ -15,6 +15,7 @@ from app.models import (
     Tournament,
     TournamentFormat,
     User,
+    utcnow,
 )
 
 
@@ -333,6 +334,7 @@ async def test_game_list_names_the_tournament_and_carries_the_latest_score() -> 
         white_version="v1",
         black_version="v1",
         tournament_id=tour.id,
+        status=ws_schemas.GameStatus.PLAYING,
         moves=["e4", "e5", "Nf3"],
         # Black's +50 from its own side is -50 for White; the later None and
         # unscored entries don't count.
@@ -346,3 +348,30 @@ async def test_game_list_names_the_tournament_and_carries_the_latest_score() -> 
 
     assert row["tournament_name"] == "Winter Open"
     assert row["score"] == {"cp": -50, "mate": None}
+
+
+async def test_game_list_keeps_playing_games_behind_a_pending_backlog() -> None:
+    _, _, engine, _ = await _setup()
+
+    def game(status: ws_schemas.GameStatus, **kw: object) -> Game:
+        return Game(
+            white=engine,
+            black=engine,
+            white_name="bot",
+            black_name="bot",
+            white_version="v1",
+            black_version="v1",
+            status=status,
+            **kw,
+        )
+
+    playing = await game(ws_schemas.GameStatus.PLAYING).insert()
+    await game(ws_schemas.GameStatus.ENDED, ended_at=utcnow()).insert()
+    new = await game(ws_schemas.GameStatus.ABORTED, ended_at=utcnow()).insert()
+    for _ in range(5):
+        await game(ws_schemas.GameStatus.PENDING).insert()
+
+    async with _client() as client:
+        rows = (await client.get("/game", params={"limit": 1})).json()
+
+    assert [r["id"] for r in rows] == [str(playing.id), str(new.id)]

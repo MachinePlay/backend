@@ -63,8 +63,7 @@ async def test_register_creates_user_and_logs_in() -> None:
 
 
 async def test_register_rejects_invalid_and_taken_handles() -> None:
-    # Handles are stored lowercase (legacy uppercase docs are migrated by
-    # scripts/lowercase_handles.py); requests are lowercased before matching.
+    # The request is lowercased before matching.
     await User(github_id=1, login="taken").insert()
 
     for bad in ["", "-foo", "foo-", "fo--o", "Foo!", "a" * 33, "machineplay"]:

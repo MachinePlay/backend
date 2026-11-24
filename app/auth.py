@@ -1,26 +1,8 @@
-"""GitHub OAuth via signed-cookie sessions, API tokens, and current-user deps.
+"""GitHub OAuth over signed-cookie sessions, API tokens, and current-user deps.
 
-This module owns auth *logic*; the HTTP endpoints that drive it live in
-:mod:`app.routes`. Login flow:
-
-  1. Browser hits ``GET /auth/github/login`` → 302 to GitHub's consent screen
-     (carrying a random ``state`` we stash in the session).
-  2. GitHub redirects back to ``GET /auth/github/callback`` with ``code`` +
-     ``state``; we verify ``state``, exchange ``code`` for an access token and
-     fetch the GitHub profile.
-  3. A known ``github_id`` is logged straight in (its id goes in the session)
-     and 302s back to the frontend. An unknown one is NOT registered yet: the
-     profile is stashed in the session as ``pending_signup`` and the browser is
-     sent to the frontend's ``/register`` page, where the user picks a handle
-     (``GET /auth/pending`` shows the suggestion, ``POST /auth/register``
-     creates the :class:`~app.models.User`).
-
-The handle (``User.login``) is chosen once at registration — it is the user's
-registry namespace and profile URL, and is never overwritten from GitHub.
-
-The session itself lives in a signed cookie managed by Starlette's
-``SessionMiddleware`` (wired up in ``app.main``); session state is passed in
-here as the plain mutable mapping Starlette exposes.
+A known GitHub account logs straight in. An unknown one is stashed in the
+session as ``pending_signup`` and sent to the frontend's ``/register`` page to
+pick a handle, which is never overwritten from GitHub afterwards.
 """
 
 import base64
@@ -50,44 +32,39 @@ GITHUB_AUTHORIZE_URL = "https://github.com/login/oauth/authorize"
 GITHUB_TOKEN_URL = "https://github.com/login/oauth/access_token"
 GITHUB_USER_URL = "https://api.github.com/user"
 
-# Handles are lowercase, 1-32 chars of [a-z0-9] with single interior hyphens.
-# They double as the user's docker-registry namespace and their profile URL,
-# which lives at the frontend root (machineplay.org/{login}) — so every
-# top-level frontend route and API-ish name must be reserved.
+# Handles are the registry namespace and the profile URL at the frontend root,
+# so every top-level frontend route must be reserved.
 HANDLE_RE = re.compile(r"^[a-z0-9](?:-?[a-z0-9]){0,31}$")
 RESERVED_HANDLES = {
     # frontend routes
-    "about",
     "cli",
+    "docs",
     "engine",
     "game",
     "register",
+    "runners",
     "tournament",
-    "u",
-    # api / infra
+    # api, infra and spares
+    "about",
     "admin",
     "api",
     "assets",
     "auth",
     "blog",
-    "docs",
     "help",
     "login",
     "logout",
     "machineplay",
     "me",
     "registry",
-    "runners",
     "settings",
     "static",
     "stream",
+    "u",
     "www",
 }
 
 Session = MutableMapping[str, Any]
-
-
-# --- API tokens -------------------------------------------------------------
 
 
 def _hash_token(plaintext: str) -> str:
@@ -118,16 +95,12 @@ async def revoke_token(user: User, token_id: UUID) -> None:
     logger.info("revoked api token %s for user=%s", token.prefix, user.login)
 
 
-# Refresh a token's last_used_at at most this often. A burst of authenticated
-# requests (e.g. registry pulls during a tournament) then collapses to one write
-# per token per interval instead of one per request. last_used_at is only shown
-# as "last used …" in the token UI, so minute-granularity is plenty.
+# Bursts of authenticated requests write last_used_at once per interval, not
+# once per request; the token UI only needs minute granularity.
 LAST_USED_THROTTLE = timedelta(seconds=60)
 
 
 async def user_from_token(plaintext: str) -> User | None:
-    """Resolve a user from a plaintext API token, refreshing its last-used time
-    at most once per ``LAST_USED_THROTTLE``."""
     if not plaintext:
         return None
     token = await ApiToken.find_one(ApiToken.token_hash == _hash_token(plaintext))
@@ -138,21 +111,14 @@ async def user_from_token(plaintext: str) -> User | None:
 
 
 async def _touch_last_used(token: ApiToken) -> None:
-    """Bump ``last_used_at`` with a targeted ``$set``, skipping the write when the
-    stored value is still within ``LAST_USED_THROTTLE`` of now."""
     now = utcnow()
     if token.last_used_at is not None and now - token.last_used_at < LAST_USED_THROTTLE:
         return
     await token.set({ApiToken.last_used_at: now})
 
 
-# --- current-user resolution (FastAPI dependencies) -------------------------
-
-
 async def user_from_auth_header(header: str) -> User | None:
-    """Resolve a user from an ``Authorization: Bearer <token>`` header value, or
-    None. Works off the raw header string so both HTTP requests and the runner
-    WebSocket handshake can share it."""
+    """Takes the raw header so the runner WebSocket handshake can share it."""
     scheme, _, plaintext = header.partition(" ")
     if scheme.lower() != "bearer" or not plaintext:
         return None
@@ -160,7 +126,6 @@ async def user_from_auth_header(header: str) -> User | None:
 
 
 async def _user_from_bearer(request: Request) -> User | None:
-    """Resolve a user from an ``Authorization: Bearer <token>`` header, or None."""
     return await user_from_auth_header(request.headers.get("Authorization", ""))
 
 
@@ -173,18 +138,13 @@ async def get_current_user(request: Request) -> User | None:
 
 
 async def require_user(user: User | None = Depends(get_current_user)) -> User:
-    """Dependency that 401s when there is no logged-in user."""
     if user is None:
         raise AuthError()
     return user
 
 
 async def require_token_user(request: Request) -> User:
-    """Resolve the user from an ``Authorization: Bearer <token>`` header.
-
-    Used by CLI-facing endpoints (engine upload) where there is no browser
-    session. 401s on a missing or unknown token.
-    """
+    """For CLI-facing endpoints, which have no browser session."""
     user = await _user_from_bearer(request)
     if user is None:
         raise AuthError("missing or invalid bearer token")
@@ -192,24 +152,20 @@ async def require_token_user(request: Request) -> User:
 
 
 async def user_from_basic(request: Request) -> User | None:
-    """Resolve a user from the ``mp_`` token sent as an HTTP Basic password.
+    """The ``mp_`` token ``docker login`` sends as the Basic password.
 
-    Used by the docker-registry token endpoint (``docker login`` sends the
-    token as the Basic password). Returns None when no Basic credentials were
-    sent (anonymous pulls); 401s when credentials were sent but don't resolve.
+    None for anonymous pulls; 401s on credentials that don't resolve.
     """
     password = _basic_password(request)
     if password is None:
         return None
     user = await user_from_token(password)
     if user is None:
-        # docker login surfaces this as an auth failure.
         raise AuthError("invalid registry credentials")
     return user
 
 
 def _basic_password(request: Request) -> str | None:
-    """Return the password from an ``Authorization: Basic`` header, or None."""
     header = request.headers.get("Authorization", "")
     scheme, _, encoded = header.partition(" ")
     if scheme.lower() != "basic" or not encoded:
@@ -220,9 +176,6 @@ def _basic_password(request: Request) -> str | None:
         return None
     _, _, password = decoded.partition(":")
     return password or None
-
-
-# --- GitHub OAuth flow -------------------------------------------------------
 
 
 def begin_github_login(session: Session) -> str:
@@ -283,8 +236,6 @@ async def complete_github_login(session: Session, code: str, state: str) -> str:
     gh = await _fetch_github_profile(code)
     user = await User.find_one(User.github_id == gh["id"])
     if user is None:
-        # Unknown GitHub account: stash the profile and let the user pick a
-        # handle on the frontend's /register page before creating anything.
         session["pending_signup"] = {
             "github_id": gh["id"],
             "login": gh["login"],
@@ -293,8 +244,7 @@ async def complete_github_login(session: Session, code: str, state: str) -> str:
         }
         return f"{settings.frontend_url}/register"
 
-    # Refresh profile fields that may have changed on GitHub. The handle
-    # (login) is chosen at registration and never overwritten.
+    # The handle is never overwritten from GitHub.
     user.name = gh.get("name")
     user.avatar_url = gh.get("avatar_url", "")
     await user.save()
@@ -321,8 +271,7 @@ async def register(session: Session, requested_login: str) -> User:
     if not pending:
         raise AuthError("no signup in progress")
 
-    # The GitHub account may have completed registration in another tab while
-    # this signup was pending; if so just log it in.
+    # Another tab may have finished this signup already.
     user = await User.find_one(User.github_id == pending["github_id"])
     if user is None:
         login = requested_login.strip().lower()

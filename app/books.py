@@ -1,20 +1,8 @@
-"""Opening books: where a game's starting line comes from.
+"""Opening books, so two deterministic engines don't replay one game.
 
-Two deterministic engines given the same start position play the same game
-every time, so a tournament between them is one game replayed N times — the
-"forty draws out of forty" the starter tutorial uses to show a broken
-experiment. Dealing each game a different opening is the standard fix.
-
-The books themselves ship with the backend as files under `books/` and are
-seeded into Mongo on startup; `seed()` is idempotent, so a wiped database (or a
-test's clean slate) refills itself. Everything downstream refers to a book by
-`slug` rather than document id, since a re-seed preserves the former.
-
-The shipped file is a Polyglot `.bin`, which is an *engine* book — a map from
-position to weighted moves, meant to be consulted move by move during play.
-fastchess cannot use one (it takes only `-openings format=(epd|pgn)`), and it
-isn't what we want anyway: what we want is the set of lines the book can reach
-in its first few plies, which is a plain walk of its own entries.
+Books ship under `books/` as Polyglot `.bin` files and are seeded into Mongo on
+startup. fastchess can't read Polyglot, so we walk each book's first plies into
+plain move lines.
 """
 
 import logging
@@ -33,37 +21,21 @@ logger = logging.getLogger(__name__)
 
 BOOKS_DIR = Path(__file__).resolve().parent.parent / "books"
 
-# How deep a line is walked: eight plies (four moves a side) is deep enough to
-# reach a real opening and shallow enough to leave the engines a game to play.
+# Deep enough to reach a real opening, shallow enough to leave a game to play.
 PLIES = 8
-
-# Shortest line worth starting from. Below this the engines are effectively
-# still on move one and the book has bought nothing.
 MIN_PLIES = 4
 
-# The book a tournament (or a one-off game) uses unless told otherwise. Playing
-# from the initial position is the explicit choice, not the default: with
-# deterministic engines it makes a tournament one game replayed N times.
 DEFAULT_SLUG = "perfect2021"
 
-# What a caller passes instead of a slug to play from the initial position. A
-# sentinel rather than null so "no book" and "field omitted" stay distinct —
-# omitting it has to mean the default.
+# Not null, so "no book" stays distinct from an omitted field (the default).
 NO_BOOK = "none"
 
 
 def enumerate_polyglot(path: Path, plies: int) -> list[tuple[str, ...]]:
     """Every line the Polyglot book at `path` reaches within `plies`.
 
-    Exhaustive rather than sampled: the walk only follows the book's own
-    entries, so it terminates by itself, is fast (~60ms for a 5000-entry book
-    at 8 plies), and gives the same complete set every time — where sampling
-    gave a smaller, seed-dependent subset. Entry weights are ignored: they
-    order an engine's *choice* during play, whereas here every line the book's
-    author included is one worth starting from.
-
-    A branch that runs out of book, or reaches a finished position, contributes
-    what it got to; the caller drops the ones too short to be openings.
+    Exhaustive (~60ms at 8 plies) and weight-blind. A branch that runs out of
+    book stops short; the caller drops lines too short to be openings.
     """
     lines: list[tuple[str, ...]] = []
 
@@ -90,8 +62,6 @@ def enumerate_polyglot(path: Path, plies: int) -> list[tuple[str, ...]]:
 
 @dataclass(frozen=True)
 class ShippedBook:
-    """One book as it ships: its identity plus how to build its lines."""
-
     slug: str
     name: str
     description: str
@@ -121,17 +91,11 @@ SHIPPED = [
 
 @cache
 def _lines(slug: str) -> list[list[str]]:
-    """A shipped book's lines, walked once per process."""
     return next(b for b in SHIPPED if b.slug == slug).lines()
 
 
 async def seed() -> None:
-    """Insert any shipped book the database doesn't have yet.
-
-    Called on startup (and by the test fixtures, which wipe every collection
-    between tests). Existing books are left alone unless their line count has
-    changed, which is the cheap way to notice a re-walked book.
-    """
+    """Insert missing shipped books; re-save one whose line count changed."""
     for shipped in SHIPPED:
         lines = _lines(shipped.slug)
         doc = await Book.find_one(Book.slug == shipped.slug)
@@ -162,8 +126,7 @@ async def get(slug: str) -> Book:
 
 
 async def resolve(slug: str) -> Book | None:
-    """The requested book, or None for the "play from the initial position"
-    sentinel. Raises NotFoundError for anything else."""
+    """The book, or None for `NO_BOOK`."""
     return None if slug == NO_BOOK else await get(slug)
 
 
@@ -172,12 +135,8 @@ async def list_books() -> list[Book]:
 
 
 def order(book: Book, seed_value: int) -> list[list[str]]:
-    """The book's lines in one tournament's own order.
-
-    A tournament shuffles once with its stored seed and then deals openings by
-    index, so two tournaments of the same shape don't play the same openings in
-    the same sequence while either one stays reproducible from its seed.
-    """
+    """The book's lines shuffled by a tournament's seed: different per
+    tournament, reproducible within one."""
     shuffled = list(book.lines)
     random.Random(seed_value).shuffle(shuffled)
     return shuffled

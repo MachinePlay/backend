@@ -7,8 +7,7 @@ from app.schemas import GameOut, UserProfileOut
 
 
 async def find_by_login(login: str) -> User | None:
-    """Case-insensitive lookup: handles are stored lowercase (validated at
-    registration), so lowercasing the input gives an exact, indexable match."""
+    # Handles are stored lowercase.
     return await User.find_one(User.login == login.lower())
 
 
@@ -20,7 +19,6 @@ async def by_login(login: str) -> User:
 
 
 async def profile(login: str) -> UserProfileOut:
-    """Public profile: the user, their engines, and those engines' games."""
     user = await by_login(login)
     owned = await Engine.find({"owner.$id": user.id}).to_list()
     recent = await games.recent_games([e.id for e in owned])

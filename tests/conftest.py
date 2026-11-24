@@ -59,9 +59,7 @@ async def clean_db(mongo_client: AsyncMongoClient[dict[str, Any]]) -> None:
     db = mongo_client["machineplay_test"]
     for name in await db.list_collection_names():
         await db[name].delete_many({})
-    # Books are shipped data, not test fixtures: reseed them the way startup
-    # does so every test sees the same catalog the app does. The walk itself is
-    # cached per process, so this is one upsert.
+    # Books are shipped data; reseed them as startup does.
     await books.seed()
 
 

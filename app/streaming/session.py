@@ -17,12 +17,7 @@ logger = logging.getLogger(__name__)
 
 
 async def runner_session(ws: WebSocket) -> None:
-    """Lifecycle of one connected runner: authenticate it, upsert its durable
-    record, mark it online, pump game events from the socket into persistence +
-    fan-out, pump scheduled commands back, and abort its games + mark it offline
-    when it disconnects."""
-    # Authenticate on the handshake (before accept) so an unknown token is a 403
-    # rejection rather than an accepted-then-closed socket.
+    # Authenticate before accept, so a bad token is a 403, not a closed socket.
     user = await auth.user_from_auth_header(ws.headers.get("Authorization", ""))
     if user is None:
         logger.warning("runner WS rejected: missing/invalid bearer token")
@@ -36,7 +31,7 @@ async def runner_session(ws: WebSocket) -> None:
         user, intro.runner_id, intro.name, intro.max_games, intro.hardware
     )
     if doc is None:
-        # Runner id belongs to someone else — refuse to let them impersonate it.
+        # The runner id belongs to someone else.
         await ws.close(code=1008)
         return
 
@@ -49,9 +44,7 @@ async def runner_session(ws: WebSocket) -> None:
         user.login,
         intro.max_games,
     )
-    # Let schedulers resume work pinned to this runner (tournaments re-queue and
-    # dispatch their pending pairings). Enqueues onto scheduled_commands, which
-    # the sender below drains once it starts.
+    # Tournaments enqueue their pending pairings; the sender drains them below.
     await runners.notify_connected(intro.runner_id)
 
     async def receiver() -> None:
@@ -60,8 +53,6 @@ async def runner_session(ws: WebSocket) -> None:
             cmd: schemas.ClientCommandType = schemas.client_adapter.validate_json(data)
             match cmd:
                 case schemas.GameEvent(game_id=game_id, event=event):
-                    # Only accept events for games scheduled on this runner —
-                    # one runner must not be able to write another's games.
                     if not runner.is_playing(game_id):
                         logger.warning(
                             "runner=%s sent event for game=%s it doesn't play",
@@ -106,11 +97,8 @@ async def runner_session(ws: WebSocket) -> None:
     finally:
         recv_task.cancel()
         send_task.cancel()
-        # Take the runner offline first so nothing new gets scheduled onto it,
-        # then abort whatever it was mid-game on. The durable doc stays; only
-        # the live connection goes away. If the runner already reconnected
-        # (mark_offline returns False because a newer connection replaced this
-        # one), the runner is still online — don't broadcast it offline.
+        # Offline first, so nothing new is scheduled onto it. A runner that
+        # already reconnected stays online.
         went_offline = runners.mark_offline(runner)
         if went_offline:
             runner_stream.broadcast(
@@ -121,7 +109,6 @@ async def runner_session(ws: WebSocket) -> None:
                     telemetry=None,
                 )
             )
-        # This session's games died with its runner process either way.
         for game_id in runner.game_ids():
             await abort_game(game_id, reason="runner disconnected")
         await runners.touch_last_seen(intro.runner_id)

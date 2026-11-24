@@ -1,22 +1,5 @@
-"""One-off migration: drop the Game index that the tournament page outgrew.
-
-``Game`` used to carry a single-field ``tournament_id`` index. Paging the
-pairings list and filtering it by status need the sort key too, so the model now
-declares two compound indexes — ``(tournament_id, tournament_seq, created_at)``
-and ``(tournament_id, status, tournament_seq, created_at)``. The first has
-``tournament_id`` as its prefix, so it answers everything the old index did and
-the old one is dead weight: pure write cost on the collection that grows
-fastest, now that a tournament can run to 2000 games.
-
-Beanie creates the indexes a model declares but never drops the ones it stopped
-declaring, so this has to be done by hand.
-
-Idempotent: a database without the old index is left alone.
-
-Run from ``backend/`` (``PYTHONPATH=.`` so ``app`` imports resolve)::
-
-    PYTHONPATH=. uv run python migrations/004_drop_redundant_tournament_index.py
-"""
+"""Drop Game's ``tournament_id`` index: the compound tournament indexes start
+with it, and beanie never drops indexes a model stopped declaring."""
 
 import asyncio
 

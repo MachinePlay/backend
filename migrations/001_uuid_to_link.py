@@ -1,19 +1,5 @@
-"""One-off migration: convert raw UUID foreign-key fields to Beanie Link DBRefs.
-
-The backend's relations moved from ``<name>_id: UUID`` columns to
-``<name>: Link[...]`` fields, which MongoDB stores as DBRefs (``{$ref, $id}``).
-This rewrites existing documents in place and drops the now-stale unique indexes
-that were built on the old id fields (beanie now indexes ``<field>.$id``).
-
-Idempotent: a document that already carries the new field (or is missing the old
-one) is left untouched. It targets whatever ``MONGO_URL`` / ``MONGO_DB`` resolve
-to via the environment / ``.env`` — point those at the database you mean to
-migrate, and take a backup first.
-
-Run from ``backend/`` (``PYTHONPATH=.`` so ``app`` imports resolve)::
-
-    PYTHONPATH=. uv run python migrations/001_uuid_to_link.py
-"""
+"""Convert ``<name>_id: UUID`` fields to ``<name>: Link[...]`` DBRefs, and drop
+the unique indexes built on the old fields."""
 
 import asyncio
 from typing import Any
@@ -23,8 +9,7 @@ from pymongo import AsyncMongoClient
 
 from app.config import settings
 
-# collection -> (old UUID field, new Link field, target collection / $ref).
-# Target collections are the beanie class names (== their collection names).
+# collection -> (old UUID field, new Link field, $ref collection).
 FIELD_MIGRATIONS: dict[str, list[tuple[str, str, str]]] = {
     "Engine": [("owner_id", "owner", "User")],
     "EngineVersion": [("engine_id", "engine", "Engine")],

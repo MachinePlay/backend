@@ -89,9 +89,6 @@ async def _tournament(
     )
 
 
-# --- who may delete ----------------------------------------------------------
-
-
 async def test_delete_account_requires_login() -> None:
     assert await _delete_account(None) == 401
 
@@ -110,9 +107,6 @@ async def test_delete_account_only_deletes_the_caller(
     assert await User.get(bob.id) is None
     assert await User.get(alice.id) is not None
     assert await Engine.find({"owner.$id": alice.id}).count() == 1
-
-
-# --- what the account takes with it ------------------------------------------
 
 
 async def test_delete_account_removes_engines_versions_tokens_and_runners(
@@ -186,9 +180,6 @@ async def test_delete_account_keeps_played_history(
     assert stored.created_by == DELETED_LOGIN
     assert {p.engine_name for p in stored.participants} == {"sf", "lc0"}
     assert {p.version for p in stored.participants} == {"v1"}
-
-
-# --- active work is ended, not refused ---------------------------------------
 
 
 async def test_delete_account_ends_its_running_tournament_and_games(

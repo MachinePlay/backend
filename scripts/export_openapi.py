@@ -1,8 +1,4 @@
-"""Dump the FastAPI OpenAPI schema to frontend/openapi.json.
-
-Run from the `backend/` directory: `uv run python scripts/export_openapi.py`.
-The frontend's `gen-api` script consumes the file to produce TS types.
-"""
+"""Dump the OpenAPI schema to frontend/openapi.json (run via `just gen-api`)."""
 
 import json
 from pathlib import Path

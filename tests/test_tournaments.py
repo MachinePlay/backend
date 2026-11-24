@@ -20,9 +20,6 @@ from app.models import (
 from app.schemas import TournamentCreateRequest, TournamentEntry
 
 
-# --- pairing generators (pure) -----------------------------------------------
-
-
 def test_round_robin_order_covers_every_pair_both_colors() -> None:
     order = tournaments.round_robin_order(3, 2)
     # 3 unordered pairs, each played twice.
@@ -74,9 +71,6 @@ def test_gauntlet_openings_pair_by_round() -> None:
     assert [p.opening for p in per_opponent] == [0, 0, 1, 1]
 
 
-# --- helpers -----------------------------------------------------------------
-
-
 async def _engine(user: User, name: str) -> Engine:
     engine = await Engine(name=name, owner=user, owner_login=user.login).insert()
     await EngineVersion(
@@ -107,9 +101,6 @@ def _cleanup(conn: runners.RunnerConnection) -> None:
     for game_id in conn.game_ids():
         streaming.game_registry.unregister(game_id)
     runners.mark_offline(conn)
-
-
-# --- creation & dispatch -----------------------------------------------------
 
 
 async def test_create_round_robin_dispatches_up_to_capacity() -> None:
@@ -310,9 +301,6 @@ async def test_create_snapshots_chosen_version() -> None:
         _cleanup(conn)
 
 
-# --- advancing on finish -----------------------------------------------------
-
-
 async def test_finishing_a_game_dispatches_the_next_and_completes() -> None:
     user = await User(github_id=4, login="dave").insert()
     e1 = await _engine(user, "a")
@@ -419,9 +407,6 @@ async def test_disconnect_pauses_and_reconnect_resumes() -> None:
         _cleanup(conn2 if conn2 is not None else conn)
 
 
-# --- standings ---------------------------------------------------------------
-
-
 async def test_standings_score_and_order() -> None:
     user = await User(github_id=6, login="fran").insert()
     e1 = await _engine(user, "winner")
@@ -464,9 +449,6 @@ async def test_standings_score_and_order() -> None:
         assert bottom.losses == 2
     finally:
         _cleanup(conn)
-
-
-# --- cancellation ------------------------------------------------------------
 
 
 async def test_cancel_aborts_live_and_pending_games() -> None:
@@ -578,9 +560,6 @@ async def test_deleting_an_entered_version_keeps_tournament_history(
     ]
     assert {row.engine_name for row in detail.standings} == {"a", "b"}
     assert sum(row.played for row in detail.standings) == 4
-
-
-# --- limits, ordering and paging ---------------------------------------------
 
 
 def test_estimate_scales_with_base_and_increment() -> None:
@@ -728,9 +707,6 @@ async def test_games_page_is_ordered_filtered_and_bounded() -> None:
         assert playing.games[0].status == GameStatus.PLAYING
     finally:
         _cleanup(conn)
-
-
-# --- opening books -----------------------------------------------------------
 
 
 async def test_tournament_deals_paired_openings_by_default() -> None:

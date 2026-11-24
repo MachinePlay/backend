@@ -1,6 +1,4 @@
-"""Game lifecycle: persisting stream events and the single terminal path that
-runs when a game ends or is aborted, plus the hook registry schedulers use to
-react to finished games."""
+"""Persisting stream events, and the single terminal path for ending games."""
 
 import logging
 from collections.abc import Awaitable, Callable
@@ -16,9 +14,7 @@ from app.streaming.streams import game_registry, live_stream
 logger = logging.getLogger(__name__)
 
 
-# Called with (game_id, end event) after a game reaches a terminal state and
-# is persisted. This is the hook point for schedulers that react to finished
-# games (e.g. a tournament advancing to its next pairing).
+# Lets tournaments advance when a game ends.
 GameFinishedHook = Callable[[UUID, schemas.GameEndEvent], Awaitable[None]]
 _game_finished_hooks: list[GameFinishedHook] = []
 
@@ -28,18 +24,12 @@ def on_game_finished(hook: GameFinishedHook) -> None:
 
 
 async def finish_game(game_id: UUID, event: schemas.GameEndEvent) -> None:
-    """Single terminal path for a game: free its runner slot, persist the end
-    state, drop the live stream, fan out to subscribers, and notify hooks.
-
-    Used both for runner-reported ends and server-side aborts.
-    """
+    """Single terminal path for runner-reported ends and server-side aborts."""
     runners.untrack_game(game_id)
     game = game_registry.unregister(game_id)
     await persist_event(game_id, event)
     if game is not None:
         if game.uci_lines:
-            # The live UCI buffer dies with the stream; keep its tail on the
-            # doc so the debug view still works on a finished game.
             await GameDoc.find_one(GameDoc.id == game_id).update(
                 {"$set": {"uci_tail": [line.model_dump() for line in game.uci_lines]}}
             )
@@ -53,8 +43,7 @@ async def finish_game(game_id: UUID, event: schemas.GameEndEvent) -> None:
 
 
 async def abort_game(game_id: UUID, reason: str = "aborted") -> None:
-    """Mark a playing game as aborted in DB and notify subscribers. Games that
-    already reached a terminal state are left untouched (idempotent)."""
+    """Abort a playing game; no-op for one that already ended."""
     doc = await GameDoc.get(game_id)
     if doc is None or doc.status != GameStatus.PLAYING:
         game_registry.unregister(game_id)
@@ -70,11 +59,8 @@ async def abort_game(game_id: UUID, reason: str = "aborted") -> None:
 
 
 async def abort_orphan_games() -> None:
-    """Mark any DB games still in PLAYING as aborted (e.g. after backend restart).
-
-    Only PLAYING games are orphaned — their runner is gone. PENDING games were
-    never dispatched, so they're left for a scheduler to pick up (tournaments).
-    """
+    """Abort games left PLAYING by a backend restart. PENDING ones are left for
+    their tournament to dispatch."""
     orphans = await GameDoc.find(GameDoc.status == GameStatus.PLAYING).to_list()
     for doc in orphans:
         doc.status = GameStatus.ABORTED
@@ -90,9 +76,7 @@ async def persist_event(game_id: UUID, event: schemas.GameStreamEvent) -> None:
     update: dict[str, dict[str, object]] = {}
     match event:
         case schemas.EngineInfoEvent() | schemas.UciLogEvent():
-            # Live-only: an in-progress search is superseded by the move that
-            # follows it, and the transcript is kept in memory (its tail is
-            # persisted once, when the game ends).
+            # Live-only; the transcript tail is saved when the game ends.
             return
         case schemas.GameStartEvent():
             update["$set"] = {"status": GameStatus.PLAYING}
@@ -109,7 +93,6 @@ async def persist_event(game_id: UUID, event: schemas.GameStreamEvent) -> None:
         case schemas.MoveEvent(
             san=san, fen=fen, analysis=analysis, white_clock=wc, black_clock=bc
         ):
-            # `evals` stays index-aligned with `moves`, so both are pushed here.
             update["$push"] = {
                 "moves": san,
                 "evals": analysis.model_dump() if analysis else None,

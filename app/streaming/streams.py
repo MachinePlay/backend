@@ -1,15 +1,4 @@
-"""The fan-out buses and the live-game registry.
-
-A ``Broadcast[T]`` is the shared primitive: subscribers each get their own
-bounded queue and publishing never blocks — a subscriber whose queue is full
-just drops the event (with a warning). The three concrete buses layer their own
-routing on top:
-
-- ``Game``        — one per live game; every event goes to all its subscribers.
-- ``LiveStream``  — the home-page aggregate; tracks up to ``LIMIT`` live games
-                    and promotes a replacement when a tracked game ends.
-- ``RunnerStream``— runner online/telemetry/offline events; a plain bus.
-"""
+"""The fan-out buses and the live-game registry."""
 
 import asyncio
 import logging
@@ -27,7 +16,7 @@ logger = logging.getLogger(__name__)
 
 
 def _snapshot_event(doc: GameDoc) -> schemas.FenEvent:
-    """A FenEvent carrying the full current state of `doc`, for bootstrapping."""
+    """The full current state of `doc`, for bootstrapping a subscriber."""
     return schemas.FenEvent(
         fen=doc.fen,
         ply=len(doc.moves),
@@ -44,9 +33,8 @@ def _snapshot_event(doc: GameDoc) -> schemas.FenEvent:
 
 
 class Broadcast[T]:
-    """A fan-out bus: each subscriber gets its own bounded queue; publishing
-    drops (with a warning) for any subscriber whose queue is full rather than
-    blocking the publisher. `label` names the bus in log lines."""
+    """Fan-out bus with a bounded queue per subscriber; a full queue drops the
+    event rather than blocking the publisher."""
 
     def __init__(self, label: str, maxsize: int) -> None:
         self._label = label
@@ -74,9 +62,7 @@ class Broadcast[T]:
 
 
 class Game(Broadcast[schemas.GameStreamEvent]):
-    # How much of the UCI conversation is kept for late subscribers. The
-    # transcript is unbounded (an engine can print per node), so it is held as
-    # a ring buffer; its tail is persisted when the game ends.
+    # A ring buffer: an engine can print per node.
     UCI_TAIL = 400
 
     def __init__(self, game_id: UUID):
@@ -91,13 +77,8 @@ class Game(Broadcast[schemas.GameStreamEvent]):
 
 
 class LiveStream(Broadcast[tuple[UUID, schemas.GameStreamEvent]]):
-    """Broadcasts events from up to LIMIT live games to all subscribers.
-
-    Maintains a system-wide set of tracked game ids: events for tracked
-    games fan out to every subscriber, others are dropped. When a tracked
-    game ends, its slot is filled by another currently-playing game (if any)
-    and a synthetic FenEvent is emitted so subscribers can bootstrap it.
-    """
+    """The home page's feed of up to LIMIT live games. When one ends, another
+    playing game is promoted with a snapshot FenEvent."""
 
     LIMIT = 8
 
@@ -106,8 +87,7 @@ class LiveStream(Broadcast[tuple[UUID, schemas.GameStreamEvent]]):
         self.tracked: set[UUID] = set()
 
     async def broadcast(self, game_id: UUID, event: schemas.GameStreamEvent) -> None:
-        # The home page shows boards and clocks; per-search chatter would be
-        # pure noise there (and a lot of it, times every live game).
+        # The home page shows only boards and clocks.
         if isinstance(event, schemas.EngineInfoEvent | schemas.UciLogEvent):
             return
         if game_id in self.tracked:
@@ -121,8 +101,7 @@ class LiveStream(Broadcast[tuple[UUID, schemas.GameStreamEvent]]):
             self.tracked.add(game_id)
             self._publish((game_id, event))
         elif isinstance(event, schemas.GameEndEvent):
-            # Untracked game ended — still forward so any subscriber that knows
-            # about it (e.g. via the initial /game fetch) can mark it ended.
+            # A subscriber may know it from the initial /game fetch.
             self._publish((game_id, event))
 
     async def _promote(self) -> None:
@@ -138,13 +117,6 @@ class LiveStream(Broadcast[tuple[UUID, schemas.GameStreamEvent]]):
 
 
 class RunnerStream(Broadcast[RunnerLiveEvent]):
-    """Fans out runner live-status events (RunnerLiveEvent) to all subscribers.
-
-    Simpler than LiveStream: no tracking/promotion, just a broadcast bus. The
-    runner_session pushes an event on connect, on each telemetry sample, and on
-    disconnect; every SSE subscriber gets a copy keyed by runner id.
-    """
-
     def __init__(self) -> None:
         super().__init__(label="runner stream", maxsize=256)
 

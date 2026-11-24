@@ -33,9 +33,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
         await client.close()
 
 
-# Use the route's function name as the OpenAPI operationId so generated
-# clients get readable method names (e.g. `getGame` instead of
-# `get_game_game__game_id__get`).
+# Readable generated client names: `getGame`, not `get_game_game__game_id__get`.
 def _operation_id(route: APIRoute) -> str:
     return route.name
 
@@ -43,14 +41,13 @@ def _operation_id(route: APIRoute) -> str:
 API_DESCRIPTION = """
 Backend for **[MachinePlay](https://machineplay.org)**.
 
-Users upload UCI chess engines as Docker images; runners pull them from a
-private registry and play games via
+Users upload UCI chess engines as Docker images; runners pull them from the
+registry and play games via
 [fastchess](https://github.com/Disservin/fastchess), streamed live to the
 browser over Server-Sent Events.
 """
 
-# Groups the routes into named sections in the Swagger UI; each `name` matches
-# the `tags=[...]` on the corresponding router in `app/routes.py`.
+# Each `name` matches a router's `tags=[...]` in `app/routes.py`.
 TAGS_METADATA = [
     {
         "name": "Auth & account",
@@ -109,9 +106,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Signs the session cookie that holds the logged-in user id. `same_site="lax"`
-# is enough because the frontend (machineplay.org) and API (api.machineplay.org)
-# share a registrable domain; flip `cookie_secure` on in production for HTTPS.
+# `same_site="lax"` suffices: machineplay.org and api.machineplay.org share a
+# registrable domain.
 app.add_middleware(
     SessionMiddleware,
     secret_key=settings.secret_key,

@@ -1,18 +1,5 @@
-"""One-off migration: replace fastchess's "normal" reason with the real one.
-
-Finished games recorded before the runner learned to read the termination out
-of the PGN carry ``reason: "normal"`` (or nothing) — so the game page showed a
-bare ``1/2-1/2`` with no hint of whether it was repetition, the fifty-move rule
-or insufficient material. The PGN on each doc still holds the detail in its
-final move's comment, so re-derive it with the runner's own parser.
-
-Idempotent: a game whose stored reason already matches what the PGN says is
-left untouched.
-
-Run from ``backend/`` (``PYTHONPATH=.`` so ``app`` imports resolve)::
-
-    PYTHONPATH=. uv run python migrations/003_termination_from_pgn.py
-"""
+"""Replace fastchess's "normal" reason with the termination the PGN's final
+move comment records, using the runner's own parser."""
 
 import asyncio
 import io

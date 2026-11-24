@@ -1,5 +1,4 @@
-"""Engine catalog: registering pushed images, listing, deletion, and page
-assembly."""
+"""Engine catalog: registering pushed images, editing, deletion, pages."""
 
 import logging
 import re
@@ -25,14 +24,10 @@ from app.schemas import (
 
 logger = logging.getLogger(__name__)
 
-# Engine names live in URLs (machineplay.org/{login}/{engine}) and docker
-# repository paths, so they are lowercase slugs: a-z/0-9 with single interior
-# separators (. _ -), max 64 chars.
+# Engine names live in URLs and docker repository paths.
 ENGINE_NAME_RE = re.compile(r"^[a-z0-9](?:[._-]?[a-z0-9]){0,63}$")
 
-# Tags are keywords describing an engine ("python", "mcts", "rust"). Lowercase
-# like every other user-facing slug, but `+`/`#` are allowed so "c++" and "c#"
-# work. Capped in count and length so they stay renderable as pills.
+# `+`/`#` allowed for "c++" and "c#".
 TAG_RE = re.compile(r"^[a-z0-9+#](?:[._-]?[a-z0-9+#]){0,23}$")
 MAX_TAGS = 10
 
@@ -41,10 +36,7 @@ ENGINE_NAME_ERROR = (
     "interior separators (. _ -)"
 )
 
-# A version string labels one uploaded image and becomes its docker tag, so it
-# follows docker's tag grammar — mixed case allowed, unlike engine names — and
-# is capped at 64 chars so version rows stay renderable. `machineplay upload`
-# checks the same shape before it pushes.
+# Docker's tag grammar, capped at 64 chars. `machineplay upload` checks the same.
 ENGINE_VERSION_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._-]{0,63}$")
 
 ENGINE_VERSION_ERROR = (
@@ -73,7 +65,6 @@ def normalize_tags(raw: list[str]) -> list[str]:
 
 
 async def _version_counts(engine_ids: list[UUID]) -> dict[UUID, int]:
-    """Uploaded-version count per engine, in a single query."""
     if not engine_ids:
         return {}
     rows = await EngineVersion.aggregate(
@@ -105,8 +96,6 @@ async def list_engines() -> list[EngineOut]:
 
 
 async def by_name(owner: User, name: str) -> Engine:
-    """Case-insensitive engine lookup within an owner's namespace: names are
-    stored lowercase (validated at registration), so lowercase and match."""
     engine = await Engine.find_one({"owner.$id": owner.id}, Engine.name == name.lower())
     if engine is None:
         raise NotFoundError("engine not found")
@@ -133,17 +122,11 @@ async def detail(engine: Engine) -> EngineDetailOut:
 
 
 def _require_owner(user: User, engine: Engine, action: str) -> None:
-    """Owner-or-admin gate for everything that mutates an engine."""
     if engine.owner.ref.id != user.id and not user.is_admin:
         raise ForbiddenError(f"only the owner can {action}")
 
 
 async def version_by_id(engine: Engine, version_id: UUID) -> EngineVersion:
-    """One of `engine`'s uploaded versions, by id.
-
-    A version id belonging to some *other* engine is a 404 here, not a 403: the
-    URL names an engine and a version that don't go together.
-    """
     version = await EngineVersion.get(version_id)
     if version is None or version.engine.ref.id != engine.id:
         raise NotFoundError("engine version not found")
@@ -151,13 +134,8 @@ async def version_by_id(engine: Engine, version_id: UUID) -> EngineVersion:
 
 
 async def edit_engine(user: User, engine: Engine, patch: EngineUpdateRequest) -> Engine:
-    """Owner/admin-only edit of an engine's name, description and tags.
-
-    Renaming only moves the engine's URL: uploaded versions keep pointing at
-    the registry repository they were pushed to, and a digest-pinned pull does
-    not care what the engine is called. The next `machineplay upload` under the
-    *old* name would find-or-create a fresh engine, though.
-    """
+    """Renaming moves only the URL: versions keep their pushed repository, and
+    an upload under the old name creates a fresh engine."""
     _require_owner(user, engine, "edit an engine")
 
     if patch.name is not None:
@@ -184,13 +162,6 @@ async def edit_engine(user: User, engine: Engine, patch: EngineUpdateRequest) ->
 async def edit_version(
     user: User, engine: Engine, version_id: UUID, patch: EngineVersionUpdateRequest
 ) -> EngineVersion:
-    """Owner/admin-only rename of one uploaded version's label.
-
-    Only the label moves. The image stays pinned by repository+digest (the
-    registry tag written at upload is never read back), and games and
-    tournament participants keep the denormalized version string they recorded,
-    so old history keeps reading the way it was played.
-    """
     _require_owner(user, engine, "edit a version")
     version = await version_by_id(engine, version_id)
 
@@ -222,29 +193,16 @@ async def edit_version(
 
 
 async def delete_version(user: User, engine: Engine, version_id: UUID) -> None:
-    """Delete one uploaded version and (best-effort) its registry image.
+    """Delete one version and, best effort, its registry image.
 
-    Owner or admin only, and refused while that exact version is in a pending
-    or playing game. That also covers a running tournament: its pairings all
-    exist as PENDING games from creation, so an entered version can't vanish
-    mid-tournament.
-
-    Finished games and tournament participant snapshots survive — they carry
-    denormalized engine/version strings, so history still renders — but the
-    version is gone from the engine page and can't be picked for new games.
-
-    Deleting the last version is allowed: the engine stays, marked as having
-    nothing to play, and starting a game against it fails until something is
-    uploaded again. Emptiness is recoverable (upload another version), while
-    auto-deleting the engine would silently take its description, tags and URL
-    with it.
+    Refused while the version has pending or playing games, which covers
+    running tournaments. Deleting the last version leaves an empty engine
+    rather than silently taking its description, tags and URL with it.
     """
     _require_owner(user, engine, "delete a version")
     version = await version_by_id(engine, version_id)
 
-    # Matched on engine *and* version id so the query rides the white/black
-    # engine indexes; a version belongs to exactly one engine, so that's the
-    # same set of games as matching the version id alone.
+    # Engine id included so the query rides the white/black indexes.
     active = await Game.find(
         {
             "$or": [
@@ -274,11 +232,9 @@ async def delete_version(user: User, engine: Engine, version_id: UUID) -> None:
 async def _delete_manifests(versions: list[EngineVersion]) -> None:
     """Drop deleted versions' images from the registry, best effort.
 
-    Call *after* the EngineVersion docs are gone: each distinct
-    repository+digest is removed unless some surviving version still references
-    it (an identical re-upload, or the same image registered under two
-    engines). Failures are logged, not raised — an orphaned manifest only costs
-    disk until GC, while a half-done delete would be user-visible.
+    Call *after* the EngineVersion docs are gone, so a digest some surviving
+    version still references is kept. Failures only log: an orphaned manifest
+    costs disk until GC.
     """
     for repository, digest in {(v.image_repository, v.image_digest) for v in versions}:
         shared = await EngineVersion.find_one(
@@ -303,12 +259,8 @@ async def _delete_manifests(versions: list[EngineVersion]) -> None:
 
 
 async def delete_engine(user: User, engine: Engine) -> None:
-    """Delete an engine, its versions, and (best-effort) its registry images.
-
-    Owner or admin only, and refused while the engine has games pending or
-    playing. Finished games are kept — they carry denormalized names, so
-    history still renders after the engine is gone.
-    """
+    """Delete an engine, its versions and, best effort, its registry images.
+    Refused while it has games pending or playing."""
     _require_owner(user, engine, "delete an engine")
     active = await Game.find(
         {
@@ -336,14 +288,8 @@ async def delete_engine(user: User, engine: Engine) -> None:
 
 
 async def delete_owned_engines(user: User) -> int:
-    """Delete every engine `user` owns, with its versions and registry images.
-
-    The account-deletion path, so unlike `delete_engine` it asks no questions:
-    the caller has already ended the account's active games, and anything still
-    referencing these engines (finished games, tournament participants) carries
-    denormalized names that keep rendering without them. Returns the number of
-    engines deleted.
-    """
+    """Account deletion's unchecked `delete_engine`: the caller has already
+    ended the account's active games."""
     owned = await Engine.find({"owner.$id": user.id}).to_list()
     if not owned:
         return 0
@@ -364,12 +310,7 @@ async def delete_owned_engines(user: User) -> int:
 async def register_version(
     user: User, payload: EngineRegisterRequest
 ) -> EngineRegisterResponse:
-    """Record an engine version after the CLI pushed its image to the registry.
-
-    The push itself was authorized per-scope by the registry token endpoint;
-    this just find-or-creates the Engine and stores the image coordinates
-    (repository + digest) as an EngineVersion.
-    """
+    """Record a version the CLI pushed, creating the Engine on first upload."""
     name = payload.name.strip().lower()
     version = payload.version.strip()
     repository = payload.repository.strip().lower()
@@ -381,9 +322,8 @@ async def register_version(
     if not ENGINE_VERSION_RE.fullmatch(version):
         raise ConflictError(ENGINE_VERSION_ERROR)
 
-    # Defense in depth: the token issuer only grants push under the user's own
-    # namespace, but re-check here so a leaked token can't register an image
-    # under someone else's name.
+    # The registry already limits push to the user's namespace; this stops a
+    # user registering someone else's image.
     namespace = user.login.lower()
     if repository.split("/", 1)[0] != namespace:
         raise ConflictError(f"repository must be namespaced under {namespace!r}")

@@ -1,11 +1,5 @@
-"""Game lifecycle: creating and scheduling games on runners and querying
-finished ones.
-
-Creation and scheduling are separate steps so callers that prepare games ahead
-of time (tournaments) can create the docs first and dispatch them as slots free
-up: `create_game` resolves engines/versions and inserts the doc, `schedule_game`
-reserves a runner slot and sends the start command.
-"""
+"""Game lifecycle. Creating and scheduling are separate steps so tournaments
+can insert games up front and dispatch them as runner slots free up."""
 
 import logging
 import random
@@ -28,7 +22,6 @@ TC_RE = re.compile(r"^\d+(\.\d+)?(\+\d+(\.\d+)?)?$")
 
 
 async def recent_games(engine_ids: list[UUID], limit: int = 20) -> list[Game]:
-    """The latest games where any of `engine_ids` played either side."""
     if not engine_ids:
         return []
     return (
@@ -47,7 +40,6 @@ async def recent_games(engine_ids: list[UUID], limit: int = 20) -> list[Game]:
 
 
 async def _latest_version(engine_id: UUID) -> EngineVersion | None:
-    """The most recently uploaded image version for an engine, or None."""
     return (
         await EngineVersion.find({"engine.$id": engine_id})
         .sort("-created_at")
@@ -56,7 +48,6 @@ async def _latest_version(engine_id: UUID) -> EngineVersion | None:
 
 
 async def _resolve_version(engine: Engine, version_id: UUID | None) -> EngineVersion:
-    """The requested uploaded version of `engine`, or its latest when None."""
     if version_id is None:
         version = await _latest_version(engine.id)
         if version is None:
@@ -80,12 +71,8 @@ def build_game(
     book: str | None = None,
     opening_moves: list[str] | None = None,
 ) -> Game:
-    """An unsaved PENDING Game doc with everything pinned (engines, versions,
-    tc, opening).
-
-    Separate from `create_game` so a tournament can build its whole pairing
-    schedule and insert it in one batch rather than a round trip per game.
-    """
+    """An unsaved PENDING Game, so a tournament can insert its schedule in one
+    batch."""
     if not TC_RE.fullmatch(tc):
         raise ConflictError(f"invalid time control {tc!r} (expected 'base+inc')")
     return Game(
@@ -116,12 +103,6 @@ async def create_game(
     book: str | None = None,
     opening_moves: list[str] | None = None,
 ) -> Game:
-    """Insert a Game doc with everything pinned (engines, exact versions, tc,
-    opening).
-
-    The game is inserted PENDING (not scheduled yet); pass it to `schedule_game`
-    to reserve a runner slot and flip it to PLAYING.
-    """
     doc = build_game(
         white,
         black,
@@ -162,11 +143,10 @@ async def schedule_game(
     white_version: EngineVersion,
     black_version: EngineVersion,
 ) -> None:
-    """Reserve a slot on `runner`, send it the start command, and mark the game
-    PLAYING.
+    """Reserve a slot on `runner`, send it the start command, mark it PLAYING.
 
-    The capacity check and the slot reservation (`track_game`) happen with no
-    await between them, so concurrent schedulers can't oversubscribe a runner.
+    No await between the capacity check and `track_game`, so concurrent
+    schedulers can't oversubscribe a runner.
     """
     if runner.is_full():
         raise RunnerBusyError(
@@ -187,10 +167,8 @@ async def schedule_game(
         streaming.game_registry.unregister(doc.id)
         raise
 
-    # The runner may have disconnected between the capacity check and the
-    # enqueue; its cleanup could then miss this game, leaving it 'playing'
-    # forever. If this connection is no longer live, roll the slot back and
-    # let the caller decide what to do with the doc.
+    # A runner that disconnected during the enqueue had its cleanup miss this
+    # game; roll the slot back and let the caller handle the doc.
     if not runners.is_current(runner):
         runner.untrack_game(doc.id)
         streaming.game_registry.unregister(doc.id)
@@ -198,9 +176,8 @@ async def schedule_game(
             "runner went offline", details={"runner_id": str(runner.runner_id)}
         )
 
-    # The game now holds a runner slot: flip PENDING → PLAYING. Guarded on
-    # PENDING so a terminal end that raced ahead (e.g. an instant pull failure
-    # reported before this returns) isn't clobbered back to PLAYING.
+    # Guarded on PENDING so an end that raced ahead (an instant pull failure)
+    # isn't clobbered back to PLAYING.
     await Game.find_one(
         Game.id == doc.id, Game.status == schemas.GameStatus.PENDING
     ).update({"$set": {"status": schemas.GameStatus.PLAYING}})
@@ -209,7 +186,6 @@ async def schedule_game(
 
 
 async def start_game(user: User, payload: StartGameRequest) -> StartGameResponse:
-    """Create a Game doc and schedule it on the requested runner."""
     logger.info("start_game requested by user=%s", user.login)
     white = await Engine.get(payload.white_engine_id)
     black = await Engine.get(payload.black_engine_id)
@@ -220,9 +196,7 @@ async def start_game(user: User, payload: StartGameRequest) -> StartGameResponse
     black_version = await _resolve_version(black, payload.black_version_id)
 
     runner = runners.get_online(payload.runner_id)
-    # A one-off game gets a line at random rather than by index: there is no
-    # colour-reversed twin to pair it with, only the wish not to replay the
-    # same game every time two deterministic engines meet.
+    # A one-off game has no colour-reversed twin, so any random line will do.
     book = await books.resolve(payload.book)
     opening = random.choice(book.lines) if book is not None and book.lines else []
     doc = await create_game(
@@ -238,7 +212,6 @@ async def start_game(user: User, payload: StartGameRequest) -> StartGameResponse
     try:
         await schedule_game(doc, runner, white_version, black_version)
     except Exception:
-        # The game never started; don't leave an orphan 'playing' doc behind.
         await doc.delete()
         raise
 
@@ -250,8 +223,7 @@ async def start_game(user: User, payload: StartGameRequest) -> StartGameResponse
 
 
 async def cancel_game(user: User, game_id: UUID) -> None:
-    """Stop a playing game: abort it server-side immediately and tell whichever
-    runner is playing it to kill the engines/containers."""
+    """Abort a playing game and tell its runner to kill the containers."""
     doc = await get_game(game_id)
     if doc.status != schemas.GameStatus.PLAYING:
         raise ConflictError("game is not playing")

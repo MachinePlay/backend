@@ -1,13 +1,5 @@
-"""The API surface: thin routers grouped by concern.
-
-Handlers only translate HTTP (params, session, redirects) to and from the
-domain modules — auth, engines, games, users, registry, streaming. Logic
-lives there, not here.
-
-Each router carries a `tags=[...]` label that Swagger uses to group the
-endpoints; the matching descriptions live in `TAGS_METADATA` in `app/main.py`.
-The sub-routers are mounted onto `router`, which `app.main` includes.
-"""
+"""HTTP routes only; logic lives in the domain modules. Each router's `tags`
+has a description in `TAGS_METADATA` (app/main.py)."""
 
 from collections.abc import AsyncIterable
 from uuid import UUID
@@ -63,8 +55,6 @@ from app.schemas import (
 router = APIRouter()
 
 
-# --- auth & account ----------------------------------------------------------
-
 auth_router = APIRouter(tags=["Auth & account"])
 
 
@@ -107,13 +97,8 @@ async def me(user: User = Depends(auth.require_user)) -> User:
 async def delete_account(
     request: Request, user: User = Depends(auth.require_user)
 ) -> dict[str, bool]:
-    """Delete the logged-in account: engines, uploaded versions and registry
-    images go, live games and tournaments are ended, played history stays.
-
-    The website makes the user type their handle first; that gate is there to
-    slow a human down, so it isn't re-checked here. The session is cleared on
-    the way out; signing in with GitHub again starts a brand-new account.
-    """
+    """Delete the logged-in account: engines, versions and images go, live games
+    and tournaments are ended, played history stays."""
     await accounts.delete_account(user)
     request.session.clear()
     return {"success": True}
@@ -141,16 +126,10 @@ async def revoke_token(
 
 @auth_router.get("/registry/token", response_model=RegistryTokenOut)
 async def registry_token(request: Request) -> RegistryTokenOut:
-    """Docker Registry v2 token endpoint (the registry's `auth.token.realm`).
-
-    Authenticates the ``mp_`` token sent as the HTTP Basic password (written by
-    ``machineplay login``) and mints a signed JWT granting the requested scopes.
-    """
+    """Docker Registry v2 token endpoint; the ``mp_`` token is the Basic password."""
     user = await auth.user_from_basic(request)
     return registry.issue_token(user, request.query_params.getlist("scope"))
 
-
-# --- engines -------------------------------------------------------------------
 
 engines_router = APIRouter(tags=["Engines"])
 
@@ -224,16 +203,12 @@ async def delete_engine_version(
     user: User = Depends(auth.require_user),
 ) -> dict[str, bool]:
     """Delete one uploaded version and its registry image (owner/admin).
-
-    Refused while that version has a game pending or playing.
-    """
+    Refused while that version has a game pending or playing."""
     owner = await users.by_login(login)
     engine = await engines.by_name(owner, engine_name)
     await engines.delete_version(user, engine, version_id)
     return {"success": True}
 
-
-# --- profiles ------------------------------------------------------------------
 
 profiles_router = APIRouter(tags=["Profiles"])
 
@@ -243,8 +218,6 @@ async def user_profile(login: str) -> UserProfileOut:
     """Public profile: the user, their engines, and those engines' games."""
     return await users.profile(login)
 
-
-# --- runners --------------------------------------------------------------------
 
 runners_router = APIRouter(tags=["Runners"])
 
@@ -270,8 +243,6 @@ async def update_runner(
     """Edit a runner's name/description (owner only)."""
     return await runners.edit_runner(user, runner_id, payload)
 
-
-# --- games ----------------------------------------------------------------------
 
 games_router = APIRouter(tags=["Games"])
 
@@ -301,8 +272,6 @@ async def list_games(limit: int = Query(default=50, ge=1, le=200)) -> list[Game]
 async def get_game(game_id: UUID) -> Game:
     return await games.get_game(game_id)
 
-
-# --- tournaments --------------------------------------------------------------
 
 tournaments_router = APIRouter(tags=["Tournaments"])
 
@@ -340,11 +309,7 @@ async def get_tournament_games(
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
 ) -> TournamentGamesOut:
-    """A page of the tournament's pairings, in schedule order.
-
-    Paged and stripped of moves/pgn: a tournament runs to thousands of games
-    and the page polls this while it is running.
-    """
+    """A page of the tournament's pairings, in schedule order."""
     return await tournaments.tournament_games(tournament_id, status, limit, offset)
 
 
@@ -357,18 +322,13 @@ async def cancel_tournament(
     return {"success": True}
 
 
-# --- opening books ------------------------------------------------------------
-
 books_router = APIRouter(tags=["Opening books"])
 
 
 @books_router.get("/book", response_model=list[BookOut])
 async def list_books() -> list[BookOut]:
-    """The opening books a game or tournament can be dealt its start from.
-
-    Pass a book's `slug` as `book` when creating one, or `"none"` to play from
-    the initial position.
-    """
+    """Opening books; pass a `slug` as `book` when starting a game or
+    tournament, or `"none"` for the initial position."""
     return [
         BookOut(
             slug=b.slug,
@@ -382,8 +342,6 @@ async def list_books() -> list[BookOut]:
     ]
 
 
-# --- live streaming -----------------------------------------------------------
-
 streaming_router = APIRouter(tags=["Live streaming"])
 
 
@@ -395,9 +353,7 @@ async def websocket_endpoint(ws: WebSocket) -> None:
 @streaming_router.get(
     "/stream/game/{game_id}",
     response_class=EventSourceResponse,
-    # SSE responses are opaque to FastAPI's auto-schema; declaring the
-    # per-message payload here makes the event type appear in OpenAPI so
-    # the generated TS client can reference it.
+    # Puts the event type in OpenAPI for the generated TS client.
     responses={200: {"model": schemas.GameStreamEvent}},
 )
 async def sse_stream(game_id: UUID) -> AsyncIterable[schemas.GameStreamEvent]:
@@ -425,7 +381,6 @@ async def sse_runner_stream() -> AsyncIterable[RunnerLiveEvent]:
         yield event
 
 
-# Mount the grouped sub-routers onto the router that `app.main` includes.
 router.include_router(auth_router)
 router.include_router(engines_router)
 router.include_router(profiles_router)

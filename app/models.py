@@ -29,10 +29,9 @@ class User(UUIDDocument):
 
 class ApiToken(UUIDDocument):
     user: Link[User]
-    # sha256 hex of the plaintext token; the plaintext is shown to the user once
-    # and never stored.
+    # sha256 hex; the plaintext is shown to the user once and never stored.
     token_hash: Annotated[str, Indexed(unique=True)]
-    # First few chars of the plaintext, kept for display ("mp_ab12cd…").
+    # Kept for display ("mp_ab12cd…").
     prefix: str
     created_at: datetime = Field(default_factory=utcnow)
     last_used_at: datetime | None = None
@@ -41,11 +40,9 @@ class ApiToken(UUIDDocument):
 class Engine(UUIDDocument):
     name: str
     description: str = ""
-    # Free-form keywords describing the engine ("python", "mcts", "rust"),
-    # normalized and validated in app/engines.py.
+    # Free-form keywords ("python", "mcts"), normalized in app/engines.py.
     tags: list[str] = Field(default_factory=list)
-    # Engines are namespaced per owner: (owner, name) is unique. owner_login is
-    # denormalized for display, mirroring how Game stores white_name/black_name.
+    # owner_login is denormalized for display.
     owner: Link[User]
     owner_login: str
     created_at: datetime = Field(default_factory=utcnow)
@@ -60,9 +57,8 @@ class Engine(UUIDDocument):
 class EngineVersion(UUIDDocument):
     engine: Link[Engine]
     version: str
-    # Engines are pushed to the docker registry: image_repository is the repo
-    # path (e.g. "alice/myengine"), image_digest pins the exact image. The
-    # runner pulls `{registry_host}/{image_repository}@{image_digest}`.
+    # The runner pulls `{registry_host}/{image_repository}@{image_digest}`,
+    # e.g. repository "alice/myengine".
     image_repository: str
     image_digest: str
     size_bytes: int = 0
@@ -78,48 +74,34 @@ class EngineVersion(UUIDDocument):
 
 
 class Runner(UUIDDocument):
-    # Durable record of a runner. The in-memory RunnerConnection (app/runners.py)
-    # only tracks live state (online presence + scheduling); everything worth
-    # keeping across restarts/disconnects lives here. Owner is denormalized the
-    # same way Engine denormalizes owner_login for display.
+    # Survives disconnects; live state is in RunnerConnection (app/runners.py).
     owner: Link[User]
     owner_login: str
     # Seeded from the runner's hostname on first connect; owner-editable after.
     name: str
     description: str = ""
-    # Last capacity the runner reported (intro.max_games); kept for display even
-    # while the runner is offline.
+    # Last reported in the runner's Introduction; shown while it is offline.
     max_games: int = 0
-    # Static hardware description last reported in the runner's Introduction;
-    # kept for display while offline. Optional so pre-hardware docs still load.
     hardware: HardwareInfo | None = None
     created_at: datetime = Field(default_factory=utcnow)
     last_seen_at: datetime | None = None
 
 
 class Book(UUIDDocument):
-    """An opening book: the short move lines games are dealt to start from.
+    """An opening book: short lines of UCI moves games are dealt to start from.
 
-    A line is a list of UCI moves *from the standard start position*, never a
-    FEN. fastchess takes either (`-openings format=(epd|pgn)`), but a position
-    book makes it send `position fen …`, which the starter engine refuses by
-    design until the tutorial teaches that form, and which neither the runner's
-    board nor the frontend's replay knows how to start from. Moves are moves:
-    everything downstream already handles them.
-
-    Books are seeded from the files shipped in `books/` (see app/books.py) and
-    referenced by `slug`, which survives a re-seed where the document id would
-    not. Games store the line they actually played, so history stays readable
-    even if a book is later changed or dropped.
+    Lines start from the standard position, never a FEN: a position book makes
+    fastchess send `position fen …`, which the starter engine, the runner's
+    board and the frontend's replay can't start from. Seeded from `books/` and
+    referenced by `slug`, which survives a re-seed.
     """
 
     slug: Annotated[str, Indexed(unique=True)]
     name: str
     description: str
-    # Where the lines came from, for attribution on the book's page.
+    # Attribution for the book's page.
     source: str = ""
-    # How deep the lines are walked; a line may be shorter where the source
-    # book ran out.
+    # How deep the lines are walked; a line may be shorter where the book ran out.
     plies: int
     lines: list[list[str]] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=utcnow)
@@ -130,45 +112,30 @@ class Game(UUIDDocument):
     black: Link[Engine]
     white_name: str
     black_name: str
-    # Which uploaded version each side played: the display string plus the
-    # EngineVersion id it was resolved to (pins the exact image for reruns/ELO).
+    # Display string plus the EngineVersion id, which pins the exact image.
     white_version: str
     black_version: str
     white_version_id: UUID | None = None
     black_version_id: UUID | None = None
-    # The runner this game was scheduled on and the time control it played.
     runner_id: UUID | None = None
     tc: str | None = None
-    # Set when the game belongs to a tournament (M8). `tournament_seq` is the
-    # game's index in the tournament's generated pairing order: the pairings are
-    # inserted in one batch and so share a `created_at`, and the order matters
-    # (it is interleaved by round, so standings stay meaningful mid-tournament).
-    # Sorting on it keeps dispatch and the pairings list in schedule order.
+    # `tournament_seq` is the game's index in the pairing order (interleaved by
+    # round). Pairings are inserted in one batch, so `created_at` can't order them.
     tournament_id: UUID | None = None
     tournament_seq: int | None = None
-    # The opening this game was dealt: the book's slug, and the exact line as
-    # UCI moves from the start position. The moves are stored rather than a
-    # (book, index) reference so a finished game still says what it played
-    # after the book changes, and so the runner can be handed the line without
-    # a book ever reaching it. Empty for a game started from the initial
-    # position.
+    # The dealt line itself, not a (book, index) reference, so the game still
+    # says what it played after the book changes.
     book: str | None = None
     opening_moves: list[str] = Field(default_factory=list)
-    # A freshly-created game is PENDING until a runner slot is reserved for it
-    # (schedule_game flips it to PLAYING). Defaulting to PENDING keeps a
-    # not-yet-dispatched game from being treated as live or aborted-on-restart.
+    # PENDING until schedule_game reserves a runner slot and flips it to PLAYING.
     status: GameStatus = GameStatus.PENDING
     result: str | None = None
-    # How the game terminated ("time forfeit", "cancelled", "runner
-    # disconnected", …); None for a plain finish.
+    # "time forfeit", "cancelled", "runner disconnected", …; None for a plain finish.
     reason: str | None = None
     moves: list[str] = Field(default_factory=list)
-    # What each mover's search reported, parallel to `moves` (None where the
-    # engine said nothing scoreable). Drives the eval bars and the graph.
+    # Parallel to `moves`; None where the engine said nothing scoreable.
     evals: list[SearchInfo | None] = Field(default_factory=list)
-    # The tail of the game's UCI transcript, kept when the game ends so the
-    # debug view still has something to show afterwards. The live stream
-    # carries the full conversation; only this much survives.
+    # The live stream carries the full UCI transcript; only this tail is kept.
     uci_tail: list[UciLine] = Field(default_factory=list)
     fen: str = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
     pgn: str | None = None
@@ -177,9 +144,7 @@ class Game(UUIDDocument):
     created_at: datetime = Field(default_factory=utcnow)
     ended_at: datetime | None = None
 
-    # The engine ids stay in the API surface (GameOut) as plain UUIDs. Games are
-    # loaded without fetch_links, so each side is an unfetched Link: read the
-    # DBRef id straight off it (cast because bson types DBRef.id as Any).
+    # Games load without fetch_links, so read the id off the unfetched DBRef.
     @property
     def white_id(self) -> UUID:
         return cast(UUID, self.white.ref.id)
@@ -190,19 +155,12 @@ class Game(UUIDDocument):
 
     @property
     def book_plies(self) -> int:
-        """How many leading `moves` came from the book, so a viewer can tell
-        the opening apart from what the engines chose."""
+        """How many leading `moves` came from the book."""
         return len(self.opening_moves)
 
     class Settings:
-        # white/black indexes back the "games of these engines" queries on
-        # profile and engine pages. The two tournament indexes back the
-        # tournament page: the first the paginated pairings list, the second
-        # everything that filters by status (dispatching the next PENDING game,
-        # the live boards, the standings/progress aggregate). `created_at` is
-        # the last key in both so games predating `tournament_seq` still sort
-        # deterministically. The first index's `tournament_id` prefix also
-        # serves plain "games of this tournament" lookups.
+        # The tournament indexes back the pairings list and the status filters
+        # (dispatch, live boards, standings) respectively.
         indexes = [
             "created_at",
             IndexModel([("white.$id", ASCENDING)]),
@@ -226,24 +184,20 @@ class Game(UUIDDocument):
 
 
 class TournamentFormat(StrEnum):
-    # Every unordered pair plays; one engine plays all the others, respectively.
+    # Every pair plays / one engine plays all the others.
     ROUND_ROBIN = "round_robin"
     GAUNTLET = "gauntlet"
 
 
 class TournamentStatus(StrEnum):
-    # A tournament starts RUNNING (creation dispatches its first pairings) and
-    # ends COMPLETED once every pairing has a result, or ABORTED if cancelled.
     RUNNING = "running"
     COMPLETED = "completed"
     ABORTED = "aborted"
 
 
 class TournamentParticipant(BaseModel):
-    # One entrant, with its engine version pinned at tournament-creation time so
-    # a mid-tournament upload can't change which binary plays (and so per-version
-    # ELO stays attributable later). Names/version strings are denormalized for
-    # display, mirroring how Game stores white_name/white_version.
+    # The version is pinned at creation so a mid-tournament upload can't change
+    # which binary plays.
     engine_id: UUID
     engine_name: str
     version_id: UUID
@@ -252,23 +206,18 @@ class TournamentParticipant(BaseModel):
 
 class Tournament(UUIDDocument):
     name: str
-    # Creator, denormalized like Engine.owner_login / Runner.owner_login.
     creator_id: UUID
     created_by: str
-    # Every game plays on this one runner (same hardware => fair), pinned here.
+    # Every game plays on this one runner, so hardware is equal.
     runner_id: UUID
     tc: str
     format: TournamentFormat
-    # Games each pairing plays; colors alternate across them. Odd values are
-    # allowed (an intentionally color-lopsided tournament).
+    # Colors alternate across a pairing's games; odd counts are allowed.
     games_per_pairing: int
-    # The participant that plays everyone else, identified by its version id (the
-    # per-participant key). GAUNTLET only; None for round robin.
+    # GAUNTLET only: the participant that plays everyone else.
     gauntlet_head_version_id: UUID | None = None
-    # The opening book every pairing is dealt from, and the seed that fixes
-    # which of its lines this tournament uses and in what order. None plays
-    # every game from the initial position — which, with deterministic engines,
-    # means replaying one game per colour assignment.
+    # `book_seed` fixes which lines the tournament uses, in what order. No book
+    # means deterministic engines replay one game per colour assignment.
     book: str | None = None
     book_seed: int = 0
     participants: list[TournamentParticipant] = Field(default_factory=list)
@@ -277,8 +226,7 @@ class Tournament(UUIDDocument):
     ended_at: datetime | None = None
 
     class Settings:
-        # (runner_id, status) backs the resume-on-reconnect query; created_at
-        # backs the list view.
+        # (runner_id, status) backs resume-on-reconnect.
         indexes = [
             "created_at",
             IndexModel([("runner_id", ASCENDING), ("status", ASCENDING)]),

@@ -1,24 +1,9 @@
 """Docker Registry v2 token issuer.
 
-The registry (`registry.machineplay.org`) is configured with `auth.token`
-pointing its `realm` at ``GET /registry/token`` on this backend. The push/pull
-handshake is:
-
-  1. ``docker push registry.machineplay.org/<login>/<engine>:<tag>``
-  2. registry replies ``401`` with
-     ``WWW-Authenticate: Bearer realm="…/registry/token",service="…",scope="repository:<login>/<engine>:push,pull"``
-  3. docker GETs the realm with that ``service``/``scope`` and HTTP Basic auth
-     (``<login>:<mp-token>``, written by ``machineplay login``)
-  4. we authenticate the ``mp_`` token, decide which actions to grant, and mint
-     a short-lived RS256 JWT whose ``access`` claim lists the granted scopes
-  5. docker retries with ``Authorization: Bearer <jwt>``; the registry verifies
-     the signature against its ``rootcertbundle`` (the cert matching our key)
-
-The JWT header carries a libtrust key id (``kid``) derived from the signing
-key; the registry uses it to pick the matching cert from its bundle. The
-derivation is base32 of the first 240 bits of the SHA-256 of the DER-encoded
-``SubjectPublicKeyInfo``, grouped into twelve colon-separated quads — exactly
-what docker/distribution's libtrust computes for the same cert.
+The registry's `auth.token.realm` is ``GET /registry/token``. On a 401, docker
+calls it with the requested scope and HTTP Basic ``<login>:<mp-token>``; we
+mint a short-lived RS256 JWT granting what the user may do, and docker retries
+with it.
 """
 
 import base64
@@ -68,6 +53,8 @@ def _load_private_key() -> RSAPrivateKey:
 
 
 def _libtrust_kid(key: RSAPrivateKey) -> str:
+    # docker/distribution's libtrust key id: base32 of the first 240 bits of
+    # the SPKI's SHA-256, in colon-separated quads.
     der = key.public_key().public_bytes(
         encoding=serialization.Encoding.DER,
         format=serialization.PublicFormat.SubjectPublicKeyInfo,
@@ -78,11 +65,9 @@ def _libtrust_kid(key: RSAPrivateKey) -> str:
 
 
 def _load_cert_x5c() -> str | None:
-    """Return the signing cert as a base64 (std) DER string for the `x5c` header.
+    """The signing cert as base64 DER for the `x5c` header.
 
-    Optional: without it the token falls back to a bare `kid`, which the registry
-    will reject under distribution v3 (its kid trust-set isn't fed from the
-    rootcertbundle). Required in production.
+    Optional, but distribution v3 rejects tokens with only a `kid`.
     """
     if settings.registry_auth_cert_file is not None:
         pem = settings.registry_auth_cert_file.read_bytes()
@@ -103,12 +88,7 @@ def _signer() -> tuple[RSAPrivateKey, str, str | None]:
 
 
 def parse_scope(scope: str) -> Access | None:
-    """Parse a ``repository:<name>:<actions>`` scope string into an Access.
-
-    Repository names may contain ``/`` but never ``:`` (that separates the
-    fields), so split on the first and last colons. Returns None for malformed
-    or unsupported (non-repository) scopes.
-    """
+    """Parse ``repository:<name>:<actions>``; None if malformed or unsupported."""
     parts = scope.split(":")
     if len(parts) < 3 or parts[0] != "repository":
         return None
@@ -120,12 +100,7 @@ def parse_scope(scope: str) -> Access | None:
 
 
 def grant_scopes(scopes: list[str], namespace: str | None) -> list[Access]:
-    """Decide which of the requested scope actions to grant.
-
-    ``pull`` is always allowed (engines are public); ``push`` only when the
-    repository is namespaced under ``namespace`` (the authenticated user's
-    login). Malformed or unsupported scopes are skipped.
-    """
+    """``pull`` is always granted; ``push`` only under the user's ``namespace``."""
     granted: list[Access] = []
     for scope in scopes:
         access = parse_scope(scope)
@@ -147,7 +122,7 @@ def grant_scopes(scopes: list[str], namespace: str | None) -> list[Access]:
 
 
 def issue_token(user: User | None, scopes: list[str]) -> RegistryTokenOut:
-    """Mint a registry token response for `user` (None = anonymous pull-only)."""
+    """`user` None is an anonymous pull."""
     namespace = user.login.lower() if user else None
     token, ttl = make_token(
         subject=user.login if user else "",
@@ -162,16 +137,10 @@ def issue_token(user: User | None, scopes: list[str]) -> RegistryTokenOut:
 
 
 async def delete_manifest(repository: str, digest: str) -> None:
-    """Delete one manifest from the registry (distribution requires the digest,
-    not a tag). Raises on anything but "deleted" or "already gone".
+    """Delete one manifest; raises on anything but deleted or already gone.
 
-    Manifests are per-repository links; image blobs are content-addressed and
-    shared registry-wide, and only the offline garbage collector removes blobs
-    no manifest references anymore. So deleting a manifest under one user's
-    repository can't break another user who pushed the identical image — their
-    repository keeps its own manifest, which keeps the shared blobs alive.
-
-    No-op when REGISTRY_API_URL is unset (local dev without a registry).
+    Safe for other users with the identical image: blobs are shared, but each
+    repository has its own manifest keeping them alive until GC.
     """
     if not settings.registry_api_url:
         logger.info(
@@ -180,8 +149,7 @@ async def delete_manifest(repository: str, digest: str) -> None:
             digest,
         )
         return
-    # The registry enforces token auth on every request, so mint ourselves one:
-    # DELETE endpoints require the "delete" action (never granted to users).
+    # The "delete" action is never granted to users.
     token, _ = make_token(
         subject="machineplay-backend",
         granted=[Access(type="repository", name=repository, actions=["delete"])],
@@ -199,7 +167,7 @@ async def delete_manifest(repository: str, digest: str) -> None:
 
 
 def make_token(subject: str, granted: list[Access]) -> tuple[str, int]:
-    """Sign a registry JWT for `subject` granting `granted`. Returns (jwt, ttl)."""
+    """Returns (jwt, ttl)."""
     key, kid, x5c = _signer()
     now = int(time.time())
     ttl = settings.registry_token_ttl
@@ -208,16 +176,14 @@ def make_token(subject: str, granted: list[Access]) -> tuple[str, int]:
         "sub": subject,
         "aud": settings.registry_host,
         "iat": now,
-        "nbf": now - 10,  # small skew allowance
+        "nbf": now - 10,  # clock skew
         "exp": now + ttl,
         "jti": secrets.token_urlsafe(16),
         "access": [
             {"type": a.type, "name": a.name, "actions": a.actions} for a in granted
         ],
     }
-    # x5c carries the signing cert so the registry verifies it against its
-    # rootcertbundle (the path distribution v3 actually trusts); kid is kept as a
-    # fallback for v2-style servers.
+    # distribution v3 trusts x5c; kid only matters to older servers.
     headers: dict[str, object] = {"kid": kid}
     if x5c is not None:
         headers["x5c"] = [x5c]

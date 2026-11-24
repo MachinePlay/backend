@@ -22,12 +22,9 @@ class StartGameRequest(BaseModel):
     # Specific uploaded versions to play; defaults to each engine's latest.
     white_version_id: UUID | None = None
     black_version_id: UUID | None = None
-    # Time control "base+inc" in seconds (e.g. "30+0.3"); defaults to the
-    # server-wide setting.
+    # "base+inc" in seconds (e.g. "30+0.3"); defaults to the server setting.
     tc: str | None = None
-    # Opening book to deal this game's starting line from, by slug. "none"
-    # plays from the initial position — which, between two deterministic
-    # engines, is the same game every time.
+    # Book slug; "none" plays from the initial position.
     book: str = books.DEFAULT_SLUG
 
 
@@ -38,9 +35,7 @@ class StartGameResponse(BaseModel):
 
 
 class RunnerOut(BaseModel):
-    # runner_id is the runner's stable doc id (kept as `runner_id`, not `id`, so
-    # the frontend and StartGameRequest agree on the field name). `online` is the
-    # live status; `active_games` is only meaningful while online.
+    # `runner_id`, not `id`, to match StartGameRequest.
     runner_id: UUID
     name: str
     description: str
@@ -49,8 +44,7 @@ class RunnerOut(BaseModel):
     max_games: int
     active_games: int = 0
     last_seen_at: datetime | None = None
-    # Static hardware (CPU/RAM); shown even when offline. `telemetry` is the last
-    # live utilization sample, present only while online.
+    # `telemetry` is the last live sample, present only while online.
     hardware: HardwareInfo | None = None
     telemetry: Telemetry | None = None
 
@@ -66,7 +60,7 @@ class RunnerLiveEvent(BaseModel):
 
 
 class RunnerUpdateRequest(BaseModel):
-    # Owner-editable metadata. Omitted fields are left unchanged.
+    # Omitted fields are left unchanged.
     name: str | None = None
     description: str | None = None
 
@@ -138,29 +132,24 @@ class EngineDetailOut(BaseModel):
 
 
 class EngineUpdateRequest(BaseModel):
-    # Owner-editable metadata. Omitted fields are left unchanged; `tags`
-    # replaces the whole list. Renaming moves the engine's URL.
+    # Omitted fields are left unchanged; `tags` replaces the whole list.
     name: str | None = Field(default=None, max_length=64)
     description: str | None = Field(default=None, max_length=500)
     tags: list[str] | None = None
 
 
 class EngineVersionUpdateRequest(BaseModel):
-    # Owner-editable metadata of one uploaded version. Renaming only moves the
-    # label: the image stays pinned by repository+digest, and games/tournaments
-    # keep the version string they recorded when they were played.
+    # Renaming only moves the label: games and tournaments keep the string they
+    # recorded.
     version: str | None = Field(default=None, max_length=64)
 
 
 class EngineRegisterRequest(BaseModel):
-    # URL-safe engine name chosen at upload (machineplay.org/{login}/{name}).
     name: str
     version: str
-    # Docker repository the CLI pushed to, e.g. "alice/myengine" (no host/tag).
+    # e.g. "alice/myengine", no host or tag.
     repository: str
-    # Image digest from `docker push`, e.g. "sha256:…".
     digest: str
-    # Image size in bytes (from `docker inspect`), for display.
     size_bytes: int = 0
 
 
@@ -200,7 +189,6 @@ class GameOut(BaseModel):
     black_name: str
     white_version: str
     black_version: str
-    # Exact version each side played; keys standings by (engine, version).
     white_version_id: UUID | None = None
     black_version_id: UUID | None = None
     status: GameStatus
@@ -214,9 +202,7 @@ class GameOut(BaseModel):
     tc: str | None = None
     runner_id: UUID | None = None
     tournament_id: UUID | None = None
-    # The opening book this game was dealt from, and how many leading `moves`
-    # came out of it rather than from an engine. Zero for a game that started
-    # from the initial position.
+    # `book_plies`: how many leading `moves` came from the book.
     book: str | None = None
     book_plies: int = 0
     created_at: datetime
@@ -224,15 +210,11 @@ class GameOut(BaseModel):
 
 
 class GameDetailOut(GameOut):
-    """One game's page: everything the list view carries, plus the analysis the
-    engines produced. Both fields are per-ply and can run to hundreds of
-    entries, so they stay out of the list responses."""
+    """GameOut plus the per-ply analysis, too big for list responses."""
 
-    # Parallel to `moves`: what each mover's search reported, for the eval bars
-    # and the analysis view.
+    # Parallel to `moves`.
     evals: list[SearchInfo | None] = []
-    # The end of the UCI conversation, kept when the game finished (empty while
-    # it is still being streamed — the SSE stream carries it live).
+    # Empty while the game is live; the SSE stream carries the transcript.
     uci_tail: list[UciLine] = []
 
 
@@ -249,36 +231,27 @@ class UserProfileOut(BaseModel):
 
 class TournamentEntry(BaseModel):
     engine_id: UUID
-    # Specific uploaded version to enter; defaults to the engine's latest. The
-    # chosen version is snapshotted onto the tournament at creation.
+    # Defaults to the engine's latest.
     version_id: UUID | None = None
 
 
 class TournamentCreateRequest(BaseModel):
     name: str
     format: TournamentFormat
-    # Participants (engine + optional version). Each (engine, version) pair must
-    # be distinct — the same engine may enter at two versions. Between 2 and the
-    # participant cap.
+    # Distinct (engine, version) pairs: one engine may enter at two versions.
     entries: list[TournamentEntry]
-    # Required for GAUNTLET: the index into `entries` of the head participant.
-    # Ignored for round robin.
+    # GAUNTLET only: index into `entries` of the head participant.
     gauntlet_head_index: int | None = None
-    # Games each pairing plays (colors alternate). Odd values allowed.
     games_per_pairing: int = 2
-    # The runner every game plays on (must be online).
+    # Must be online.
     runner_id: UUID
-    # Time control "base+inc"; defaults to the server-wide setting.
     tc: str | None = None
-    # Opening book every pairing is dealt from, by slug. "none" plays every
-    # game from the initial position, which between deterministic engines makes
-    # the whole tournament one game per colour assignment.
+    # Book slug; "none" plays from the initial position.
     book: str = books.DEFAULT_SLUG
 
 
 class BookOut(BaseModel):
-    """One opening book in the catalog. `lines` is a count, not the lines
-    themselves: the browser only needs to name and size the choice."""
+    """One opening book in the catalog; `lines` is a count."""
 
     slug: str
     name: str
@@ -298,10 +271,7 @@ class TournamentParticipantOut(BaseModel):
 
 
 class StandingRow(BaseModel):
-    """One participant's tally over the tournament's finished (ENDED) games.
-
-    A participant is an (engine, version) pair; version_id is its stable key.
-    """
+    """One participant's tally over the finished games, keyed by version_id."""
 
     engine_id: UUID
     engine_name: str
@@ -331,13 +301,8 @@ class TournamentOut(BaseModel):
 
 
 class TournamentGameRow(BaseModel):
-    """One pairing in the tournament's game list.
-
-    Deliberately narrower than `GameOut`: no moves, pgn or fen. A tournament
-    runs to thousands of games and the page polls while it is running, so the
-    list carries only what a row renders. The live boards (`live_games`, capped
-    by the runner's slot count) still get the full `GameOut`.
-    """
+    """One row of the pairings list: no moves, pgn or fen, since a tournament
+    runs to thousands of games and the page polls."""
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -363,11 +328,7 @@ class TournamentGamesOut(BaseModel):
 
 
 class TournamentProgress(BaseModel):
-    """How many of the tournament's games sit in each state.
-
-    Counted with one aggregate rather than by loading the games, so the page
-    stays cheap however many pairings there are.
-    """
+    """How many of the tournament's games sit in each state."""
 
     total: int
     pending: int
@@ -386,18 +347,15 @@ class TournamentDetailOut(BaseModel):
     tc: str
     games_per_pairing: int
     gauntlet_head_version_id: UUID | None
-    # The book pairings were dealt from, by slug, with its display name
-    # resolved; both None when the tournament plays from the initial position.
+    # Both None when playing from the initial position.
     book: str | None = None
     book_name: str | None = None
     participants: list[TournamentParticipantOut]
     standings: list[StandingRow]
     progress: TournamentProgress
-    # The games playing right now — what the live boards render. Bounded by the
-    # runner's `max_games`, so this stays small however big the tournament is.
+    # Bounded by the runner's `max_games`.
     live_games: list[GameOut]
-    # Rough wallclock left, from the time control and the runner's slot count;
-    # None once nothing is left to play. An estimate, not a promise.
+    # Rough wallclock left; None once nothing is left to play.
     eta_seconds: float | None = None
     created_at: datetime
     ended_at: datetime | None = None

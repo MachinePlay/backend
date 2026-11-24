@@ -1,5 +1,4 @@
-"""The SSE event sources the API routes yield from: one per game, the
-home-page live aggregate, and the runners feed."""
+"""SSE event sources: one per game, the home-page aggregate, and runners."""
 
 import asyncio
 import logging
@@ -23,12 +22,11 @@ logger = logging.getLogger(__name__)
 
 
 async def game_event_stream(game_id: UUID) -> AsyncIterator[schemas.GameStreamEvent]:
-    """Event source for one game's SSE endpoint: snapshot, then live events."""
+    """Snapshot, then live events."""
     try:
         game = game_registry.get_game(game_id)
     except NotFoundError:
-        # Game is no longer live; if it exists in the DB, emit a single
-        # terminal event so late subscribers see a clean end rather than 404.
+        # Not live anymore: a finished game gets a single end event, not a 404.
         doc = await GameDoc.get(game_id)
         if doc is None:
             raise
@@ -37,17 +35,13 @@ async def game_event_stream(game_id: UUID) -> AsyncIterator[schemas.GameStreamEv
 
     q = game.subscribe()
     try:
-        # Subscribe-then-snapshot: the WS receiver writes the DB before
-        # broadcasting, so anything already in the snapshot is also (or about
-        # to be) in our queue. Dedup queued events by ply against the snapshot
-        # so the client sees each event exactly once.
+        # Subscribe, then snapshot: the receiver writes the DB before
+        # broadcasting, so queued events up to the snapshot's ply are dupes.
         doc = await GameDoc.get(game_id)
         snapshot_ply = -1
         if doc is not None:
             snapshot_ply = len(doc.moves)
             yield _snapshot_event(doc)
-        # Whatever of the UCI conversation is still buffered, so a page opened
-        # mid-game shows the recent transcript instead of starting blank.
         if game.uci_lines:
             yield schemas.UciLogEvent(lines=list(game.uci_lines))
 
@@ -71,7 +65,6 @@ async def game_event_stream(game_id: UUID) -> AsyncIterator[schemas.GameStreamEv
 
 
 async def live_event_stream() -> AsyncIterator[LiveStreamEvent]:
-    """Event source for the all-games SSE endpoint."""
     q = live_stream.subscribe()
     try:
         while True:
@@ -82,13 +75,8 @@ async def live_event_stream() -> AsyncIterator[LiveStreamEvent]:
 
 
 async def runner_event_stream() -> AsyncIterator[RunnerLiveEvent]:
-    """Event source for the runners SSE endpoint: a snapshot of every online
-    runner's current status, then live connect/telemetry/disconnect events.
-
-    Subscribe before snapshotting so nothing is missed in the gap; a runner that
-    both appears in the snapshot and emits a live event just gets merged twice on
-    the client (keyed by runner id), which is harmless.
-    """
+    """Snapshot of online runners, then live events. Subscribing first may
+    deliver a runner twice; the client merges by id."""
     q = runner_stream.subscribe()
     try:
         for event in runners.live_snapshot():

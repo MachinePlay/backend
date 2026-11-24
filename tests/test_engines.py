@@ -277,9 +277,6 @@ async def test_delete_engine_keeps_manifests_other_versions_still_reference(
     assert manifest_deletes == [("alice/sf", "sha256:unique")]
 
 
-# --- versions -----------------------------------------------------------------
-
-
 async def test_rename_version_owner() -> None:
     """A rename moves the label only: the image stays pinned where it was
     pushed, and a game that already played keeps the string it recorded."""

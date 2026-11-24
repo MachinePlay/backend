@@ -17,12 +17,9 @@ from app.models import (
 )
 
 
-# `dict[str, Any]` is pymongo's _DocumentType — shape of raw BSON results.
-# Irrelevant here since all reads/writes go through beanie's ODM.
 async def connect() -> AsyncMongoClient[dict[str, Any]]:
-    # uuidRepresentation="standard" is required for Link fields: beanie's codec
-    # rescues the top-level UUID _id, but the UUID nested in a Link's DBRef
-    # ($id) is encoded by pymongo and would otherwise be rejected.
+    # Link fields need uuidRepresentation="standard": beanie encodes the UUID
+    # _id itself, but pymongo encodes the one inside a Link's DBRef.
     client: AsyncMongoClient[dict[str, Any]] = AsyncMongoClient(
         settings.mongo_url,
         tz_aware=True,

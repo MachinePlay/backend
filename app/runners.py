@@ -1,11 +1,5 @@
-"""Runners: durable identity/metadata (the ``Runner`` document) plus the live
-in-memory connections.
-
-A runner is a durable record (owner, name, description) so it survives restarts
-and disconnects. Only its *live* state — the scheduling queue and the games it
-is currently playing while its WebSocket is up — lives in memory here, keyed by
-runner id. "Online" means present in the ``_online`` map.
-"""
+"""Runners: the durable ``Runner`` document plus in-memory live connections.
+"Online" means present in ``_online``."""
 
 import asyncio
 import logging
@@ -22,18 +16,13 @@ logger = logging.getLogger(__name__)
 
 
 class RunnerConnection:
-    """Live state of one connected runner: its command queue and in-flight games.
-
-    Durable identity/metadata lives on the ``Runner`` document; this exists only
-    while the runner's WebSocket is up.
-    """
+    """Live state of one connected runner: its command queue and in-flight games."""
 
     def __init__(self, runner_id: UUID, max_games: int):
         self.runner_id = runner_id
         self.max_games = max_games
         self.scheduled_commands: asyncio.Queue[schemas.ServerCommand] = asyncio.Queue()
         self._game_ids: set[UUID] = set()
-        # Last utilization sample; live-only, so it dies with the connection.
         self.latest_telemetry: schemas.Telemetry | None = None
 
     @property
@@ -59,12 +48,10 @@ class RunnerConnection:
         self.latest_telemetry = telemetry
 
 
-# Live connections keyed by runner id. Presence here == online.
 _online: dict[UUID, RunnerConnection] = {}
 
 
 def live_event(conn: RunnerConnection) -> RunnerLiveEvent:
-    """The live status of an online runner, for the /stream/runners feed."""
     return RunnerLiveEvent(
         runner_id=conn.runner_id,
         online=True,
@@ -85,9 +72,8 @@ def mark_online(runner_id: UUID, max_games: int) -> RunnerConnection:
 
 
 def mark_offline(conn: RunnerConnection) -> bool:
-    """Take `conn` offline. Returns False when the runner reconnected and a
-    newer connection already replaced this one — a stale session's cleanup must
-    not knock the live connection offline."""
+    """False when a newer connection already replaced `conn`, whose stale
+    cleanup must not knock the live one offline."""
     if _online.get(conn.runner_id) is conn:
         del _online[conn.runner_id]
         return True
@@ -104,13 +90,10 @@ def get_online(runner_id: UUID) -> RunnerConnection:
 
 
 def find_online(runner_id: UUID) -> RunnerConnection | None:
-    """The live connection for `runner_id`, or None when it's offline."""
     return _online.get(runner_id)
 
 
-# Called with a runner id right after it comes online. The hook point for
-# schedulers that resume work pinned to a runner (a tournament picking its
-# pending pairings back up once its runner reconnects).
+# Lets tournaments resume pending pairings when their runner reconnects.
 RunnerConnectedHook = Callable[[UUID], Awaitable[None]]
 _connected_hooks: list[RunnerConnectedHook] = []
 
@@ -128,7 +111,6 @@ async def notify_connected(runner_id: UUID) -> None:
 
 
 def is_current(conn: RunnerConnection) -> bool:
-    """Whether `conn` is still the live connection for its runner id."""
     return _online.get(conn.runner_id) is conn
 
 
@@ -141,7 +123,7 @@ def find_by_game(game_id: UUID) -> RunnerConnection | None:
 
 
 def untrack_game(game_id: UUID) -> None:
-    """Drop `game_id` from whichever online runner tracks it (frees the slot)."""
+    """Free `game_id`'s slot on whichever runner tracks it."""
     for conn in _online.values():
         conn.untrack_game(game_id)
 
@@ -153,12 +135,10 @@ async def upsert_on_connect(
     max_games: int,
     hardware: schemas.HardwareInfo,
 ) -> RunnerDoc | None:
-    """Create the runner's doc on first connect, or refresh it on reconnect.
+    """Create the runner's doc on first connect, or refresh what it reports.
 
-    Owner-managed fields (name, description) are set once at creation and left
-    alone afterwards so the owner's edits survive reconnects. Runner-reported
-    fields (max_games, hardware) are refreshed each connect. Returns None if the
-    runner id already belongs to a different owner (an id can't be hijacked).
+    Name and description are only seeded, so the owner's edits survive. None if
+    the id belongs to another owner.
     """
     doc = await RunnerDoc.get(runner_id)
     now = utcnow()
@@ -213,13 +193,11 @@ def _to_out(doc: RunnerDoc) -> RunnerOut:
 
 
 async def list_runners() -> list[RunnerOut]:
-    """All runners, durable metadata joined with live online status."""
     docs = await RunnerDoc.find_all().sort("+created_at").to_list()
     return [_to_out(doc) for doc in docs]
 
 
 async def get_runner(runner_id: UUID) -> RunnerOut:
-    """One runner's durable metadata joined with its live online status."""
     doc = await RunnerDoc.get(runner_id)
     if doc is None:
         raise NotFoundError("runner not found", details={"runner_id": str(runner_id)})
@@ -229,7 +207,6 @@ async def get_runner(runner_id: UUID) -> RunnerOut:
 async def edit_runner(
     user: User, runner_id: UUID, patch: RunnerUpdateRequest
 ) -> RunnerOut:
-    """Owner-only edit of a runner's name/description."""
     doc = await RunnerDoc.get(runner_id)
     if doc is None:
         raise NotFoundError("runner not found", details={"runner_id": str(runner_id)})
